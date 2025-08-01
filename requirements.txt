@@ -1,4 +1,3 @@
-python-telegram-bot==20.3
-web3==6.15.0
-python-dotenv==1.0.1
-apscheduler==3.10.4  # Required for scheduled tasks
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+web3==6.11.0
