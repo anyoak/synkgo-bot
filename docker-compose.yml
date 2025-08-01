@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  bot:
+    image: python:3.9-slim
+    container_name: synkgo-bot
+    restart: always
+    volumes:
+      - ./data:/data
+      - ./.env:/.env
+    ports:
+      - "8080:8080"  # Map health check port
+    working_dir: /app
+    command: python main.py
+    environment:
+      - PORT=8080
