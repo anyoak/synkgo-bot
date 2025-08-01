@@ -1,29 +1,24 @@
-# Use official Python image
+# Use an official Python runtime as the base image
 FROM python:3.10-slim
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libssl-dev \
-    libffi-dev \
-    python3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create and set working directory
+# Set working directory in the container
 WORKDIR /app
 
-# Copy requirements
+# Copy requirements.txt to install dependencies
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install system dependencies and Python packages
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && pip install --no-cache-dir -r requirements.txt \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy application code
-COPY . .
+# Copy the bot script
+COPY bot.py .
 
-# Run the bot
+# Set environment variable to ensure Python output is sent straight to terminal (for logs)
+ENV PYTHONUNBUFFERED=1
+
+# Command to run the bot
 CMD ["python", "main.py"]
