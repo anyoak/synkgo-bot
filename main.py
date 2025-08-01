@@ -22,7 +22,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID'))
 PRIVATE_KEY = os.getenv('PRIVATE_KEY')
 BSC_RPC = os.getenv('BSC_RPC')
-US极速赛车_CONTRACT = os.getenv('USDT_CONTRACT')
+USDT_CONTRACT = os.getenv('USDT_CONTRACT')
 
 # Initialize Web3
 w3 = Web3(Web3.HTTPProvider(BSC_RPC))
