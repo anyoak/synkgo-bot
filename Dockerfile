@@ -1,24 +1,30 @@
-# Use an official Python runtime as the base image
-FROM python:3.10-slim
+# Use official Python image
+FROM python:3.11-slim-bullseye
 
-# Set working directory in the container
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+ENV TZ=UTC
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set working directory
 WORKDIR /app
 
-# Copy requirements.txt to install dependencies
+# Copy requirements first to leverage Docker cache
 COPY requirements.txt .
 
-# Install system dependencies and Python packages
-RUN apt-get update && apt-get install -y \
-    gcc \
-    && pip install --no-cache-dir -r requirements.txt \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the bot script
-COPY bot.py .
+# Copy application code
+COPY . .
 
-# Set environment variable to ensure Python output is sent straight to terminal (for logs)
-ENV PYTHONUNBUFFERED=1
+# Create database directory
+RUN mkdir -p /data
 
-# Command to run the bot
+# Run the bot
 CMD ["python", "main.py"]
