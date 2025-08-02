@@ -202,20 +202,6 @@ def back_button():
 def admin_back_button():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")]])
 
-# Membership verification
-async def check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    channels = ["@SynkGo", "@SynkGoPay"]
-    for channel in channels:
-        try:
-            member = await context.bot.get_chat_member(channel, user_id)
-            if member.status in ["left", "kicked"]:
-                return False
-        except Exception as e:
-            logger.error(f"Membership check error for {channel}: {e}")
-            return False
-    return True
-
 # Check if user is banned
 def is_banned(user_id: int):
     db = load_db()
@@ -258,7 +244,7 @@ def process_code_submission(user_id: int, code: str):
         return f"⏳ Please wait {int(cooldown_remaining//60)}m {int(cooldown_remaining%60)}s before submitting another code"
     if user.get('submission_count', 0) >= 30:
         return "❌ You've reached your daily submission limit (30 codes)"
-    if code in db['codes']:  # FIXED: Replaced Chinese key
+    if code in db['codes']:
         return f"❌ Code '{code}' has already been submitted"
     db['codes'][code] = {
         "status": "pending",
@@ -390,7 +376,7 @@ async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE,
             withdrawal['tx_hash'] = tx_hash
             save_db(db)
             
-            # Notify user (FIXED: Replaced Chinese text)
+            # Notify user
             await context.bot.send_message(
                 user_id,
                 f"✅ *Withdrawal Completed*\n\n"
@@ -441,27 +427,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_banned(user_id):
         await update.message.reply_text("❌ Your account has been banned. Contact @ZenEspt.")
-        return
-    
-    # Check channel membership
-    joined = await check_membership(update, context)
-    
-    if not joined:
-        # Join check buttons with message
-        keyboard = InlineKeyboardMarkup(
-            [
-                InlineKeyboardButton("Join @SynkGo", url="https://t.me/SynkGo"),
-                InlineKeyboardButton("Join @SynkGoPay", url="https://t.me/SynkGoPay")
-            ])
-        await update.message.reply_text(
-            "⚠️ *Channel Membership Required*\n\n"
-            "To use this bot, you must join our official channels:\n"
-            "- @SynkGo\n"
-            "- @SynkGoPay\n\n"
-            "📝Please join both channels and *Active your account* [`/start <code>`]. Contact your upline for a valid code, or use `/start` if you don’t have one.",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
         return
     
     db = load_db()
@@ -516,95 +481,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=user_panel()
     )
 
-async def check_joined_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    
-    if await check_membership(update, context):
-        # Create user if not exists
-        db = load_db()
-        if str(user_id) not in db['users']:
-            db['users'][str(user_id)] = {
-                "balance": 0,
-                "codes_submitted": [],
-                "submission_count": 0,
-                "last_submission": 0,
-                "referral_code": f"REF{user_id}",
-                "referred_by": None,
-                "referrals": [],
-                "referral_commission": 0,
-                "total_earned": 0,
-                "withdrawals": 0,
-                "banned": False
-            }
-            save_db(db)
-        
-        # Process referral if exists
-        if context.args:
-            ref_code = context.args[0]
-            if not db['users'][str(user_id)].get('referred_by'):
-                for uid, user_data in db['users'].items():
-                    if user_data.get('referral_code') == ref_code and int(uid) != user_id:
-                        if user_id not in user_data.get('referrals', []):
-                            db['users'][uid]['referrals'] = user_data.get('referrals', []) + [user_id]
-                            db['users'][str(user_id)]['referred_by'] = int(uid)
-                            save_db(db)
-                            await context.bot.send_message(
-                                int(uid),
-                                f"🎉 *New Referral*\n\n"
-                                f"User {user_id} joined using your referral code `{ref_code}`!\n"
-                                f"You'll earn {db['settings']['referral_rate']*100}% of their rewards.",
-                                parse_mode="Markdown"
-                            )
-        
-        # Welcome message
-        await query.edit_message_text(
-            "✅ *Membership Verified!*\n\n"
-            "You've successfully joined our channels. Welcome to SynkGo Rewards Bot!\n\n"
-            "Use the buttons below to get started.",
-            parse_mode="Markdown",
-            reply_markup=user_panel()
-        )
-    else:
-        # Still not joined
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Join @SynkGo", url="https://t.me/SynkGo"),
-                InlineKeyboardButton("Join @SynkGoPay", url="https://t.me/SynkGoPay")
-            ],
-            [InlineKeyboardButton("✅ I've Joined", callback_data="check_joined")]
-        ])
-        
-        await query.edit_message_text(
-            "❌ *You haven't joined all channels yet!*\n\n"
-            "Please make sure you've joined both:\n"
-            "- @SynkGo\n"
-            "- @SynkGoPay\n\n"
-            "After joining, click the button below.",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
-# New code command handler
 async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_banned(user_id):
         await update.message.reply_text("❌ Your account has been banned. Contact @ZenEspt.")
-        return
-    
-    # Check channel membership
-    if not await check_membership(update, context):
-        await update.message.reply_text(
-            "⚠️ Please join our official channels to use this bot:\n"
-            "- @SynkGo\n"
-            "- @SynkGoPay\n\n"
-            "Join them and try again!",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Join @SynkGo", url="https://t.me/SynkGo")],
-                [InlineKeyboardButton("Join @SynkGoPay", url="https://t.me/SynkGoPay")]
-            ])
-        )
         return
     
     # Validate command format
@@ -1253,9 +1133,6 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|approve_|reject_)"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
-    
-    # Add new callback handler
-    application.add_handler(CallbackQueryHandler(check_joined_callback, pattern="^check_joined$"))
     
     # Start the bot using polling
     logger.info("Starting bot...")
