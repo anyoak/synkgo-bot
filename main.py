@@ -452,14 +452,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 InlineKeyboardButton("Join @SynkGo", url="https://t.me/SynkGo"),
                 InlineKeyboardButton("Join @SynkGoPay", url="https://t.me/SynkGoPay")
-            ],
+            ])
         
         await update.message.reply_text(
             "⚠️ *Channel Membership Required*\n\n"
             "To use this bot, you must join our official channels:\n"
             "- @SynkGo\n"
             "- @SynkGoPay\n\n"
-            "Please join both channels and *Active your account* [`/start <code>`]. Contact your upline for a valid code, or use `/start` if you don’t have one.",
+            "📝Please join both channels and *Active your account* [`/start <code>`]. Contact your upline for a valid code, or use `/start` if you don’t have one.",
             parse_mode="Markdown",
             reply_markup=keyboard
         )
