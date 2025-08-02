@@ -45,7 +45,7 @@ def validate_private_key(key: str) -> str:
 try:
     PRIVATE_KEY = validate_private_key(PRIVATE_KEY)
     logger.info("Private key format is valid")
-    HOT_WALLET_ADDRESS = w极速赛车.eth.account.from_key(PRIVATE_KEY).address
+    HOT_WALLET_ADDRESS = w3.eth.account.from_key(PRIVATE_KEY).address
     logger.info(f"Hot wallet address: {HOT_WALLET_ADDRESS}")
 except Exception as e:
     logger.error(f"Private key error: {e}")
@@ -178,7 +178,7 @@ def get_wallet_balance():
 # Telegram UI Components
 def user_panel():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Generate Code", url="https://t.me/SynkGoPay")],
+        [InlineKeyboardButton("📋 Generate Code", url="https://t.me/+LtWJmPi8I2tkNjQ1")],
         [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw_start")],
         [InlineKeyboardButton("👥 Referral Program", callback_data="invite_panel")],
         [InlineKeyboardButton("📊 My Statistics", callback_data="user_stats")],
@@ -246,7 +246,7 @@ def process_code_submission(user_id: int, code: str):
     settings = db['settings']
     user = db['users'].get(str(user_id), {})
     if user.get('banned', False):
-        return "❌ Your account has been banned. Contact support."
+        return "❌ Your account has been banned. Contact support team."
     if db['settings']['bot_status'] != 'active':
         return "⛔ Bot is currently under maintenance. Please try again later."
     if not re.match(r'^[A-Za-z0-9]{5,15}$', code):
@@ -272,7 +272,7 @@ def process_code_submission(user_id: int, code: str):
     return (
         f"✅ Code submitted successfully!\n\n"
         f"Code: `{code}`\n"
-        f"Status: Pending approval\n\n"
+        f"Status: Pending server approval\n\n"
         f"⏳ _Review may take 5 minutes to 12 hours_"
     )
 
@@ -372,7 +372,7 @@ async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"Withdrawal ID: `{withdrawal_id}`\n"
                 f"Required: >0.001 BNB\n"
                 f"Available: `{balance['bnb']:.6f}` BNB\n\n"
-                f"Please send B极速赛车 to: `{HOT_WALLET_ADDRESS}`",
+                f"Please send BNB to: `{HOT_WALLET_ADDRESS}`",
                 parse_mode="Markdown"
             )
             await update.callback_query.edit_message_text(
@@ -440,7 +440,7 @@ async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE,
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_banned(user_id):
-        await update.message.reply_text("❌ Your account has been banned. Contact @SynkGoSupport.")
+        await update.message.reply_text("❌ Your account has been banned. Contact @ZenEspt.")
         return
     
     # চ্যানেল জয়েন চেক
@@ -508,7 +508,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         break
     save_db(db)
     await update.message.reply_text(
-        "🌟 *Welcome to SynkGo Rewards Bot!* 🌟\n\n"
+        "🌟 *Welcome to @SynkGo Rewards Bot!* 🌟\n\n"
         "💰 _Earn points by submitting codes_\n"
         "💸 _Withdraw USDT directly to your wallet_\n"
         "👥 _Invite friends for referral bonuses_\n\n"
@@ -593,7 +593,7 @@ async def check_joined_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_banned(user_id):
-        await update.message.reply_text("❌ Your account has been banned. Contact @SynkGoSupport.")
+        await update.message.reply_text("❌ Your account has been banned. Contact @ZenEspt.")
         return
     
     # Check channel membership
@@ -717,7 +717,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ *Account Suspended*\n\n"
                 f"Your account has been banned from using this bot.\n"
                 f"Reason: {reason}\n\n"
-                f"Contact @SynkGoSupport if you believe this is a mistake",
+                f"Contact @ZenEspt if you believe this is a mistake",
                 parse_mode="Markdown"
             )
         except ValueError:
@@ -793,7 +793,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     user = db['users'].get(str(user_id), {})
     if is_banned(user_id):
-        await query.edit_message_text("❌ Your account has been banned. Contact @SynkGoSupport.")
+        await query.edit_message_text("❌ Your account has been banned. Contact @ZenEspt.")
         return
     if data == "main_menu":
         await query.edit_message_text(
@@ -808,7 +808,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Minimum: {min_withdraw} points = {min_withdraw * 0.001:.3f} USDT\n"
             "Enter withdrawal amount and BEP-20 address in this format:\n\n"
             "`[POINTS] [WALLET_ADDRESS]`\n\n"
-            "Example:\n`500 0x742d35Cc6634C0532925a3b844Bc454e4438f44e`\n\n"
+            "Example:\n`500 0x742d35Cc6634C05329****44Bc454e4438f44e`\n\n"
             "💡 _1 point = 0.001 USDT_",
             parse_mode="Markdown",
             reply_markup=back_button()
@@ -1050,7 +1050,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if is_banned(user_id):
-        await update.message.reply_text("❌ Your account has been banned. Contact @SynkGoSupport.")
+        await update.message.reply_text("❌ Your account has been banned. Contact @ZenEspt.")
         return
     text = update.message.text.strip()
     if text and len(text.split()) >= 2:
@@ -1135,7 +1135,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Points: `{points}`\n"
                 f"Amount: `{points * 0.001:.3f}` USDT\n"
                 f"Address: `{address}`\极速赛车"
-                "_Waiting for admin approval..._",
+                "_Waiting for server approval..._",
                 parse_mode="Markdown",
                 reply_markup=back_button()
             )
