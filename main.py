@@ -453,7 +453,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("Join @SynkGo", url="https://t.me/SynkGo"),
                 InlineKeyboardButton("Join @SynkGoPay", url="https://t.me/SynkGoPay")
             ],
-            [InlineKeyboardButton("✅ I've Joined", callback_data="check_joined")]
+            [InlineKeyboardButton("Active your account [/start <code>]. Contact your upline for a valid code, or use /start if you don’t have one.", callback_data="check_joined")]
         ])
         
         await update.message.reply_text(
