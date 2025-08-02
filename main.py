@@ -443,11 +443,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Your account has been banned. Contact @ZenEspt.")
         return
     
-    # চ্যানেল জয়েন চেক
+    # Check channel membership
     joined = await check_membership(update, context)
     
     if not joined:
-        # জয়েন চেক বাটন সহ মেসেজ
+        # Join check buttons with message
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("Join @SynkGo", url="https://t.me/SynkGo"),
@@ -826,10 +826,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Your referral link: {ref_link}\n\n"
             f"• Total referrals: {ref_count}\n"
             f"• Active referrals (30+ codes/day): {active_refs}\n"
-            f"• Commission earned: {commission} points ({usdt_commission:.3f} USDT)\n\n"
+            f"• Commission earned: {commission:.4f} points ({usdt_commission:.6f} USDT)\n\n"
             f"🔥 _Earn {db['settings']['referral_rate']*100}% of your referrals' earnings!_\n"
             f"✅ _Active referrals submit 30+ approved codes daily_\n"
-            f"📬 _You’ll be notified when your referrals earn rewards!_",
+            f"📬 _You'll be notified when your referrals earn rewards!_",
             parse_mode="Markdown",
             reply_markup=back_button()
         )
@@ -845,7 +845,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏆 Total Earned: {total_earned} points\n"
             f"📨 Codes Submitted Today: {submissions}/30\n"
             f"👥 Referrals: {len(user.get('referrals', []))}\n"
-            f"🎯 Referral Commission: {user.get('referral_commission', 0)} points",
+            f"🎯 Referral Commission: {user.get('referral_commission', 0):.4f} points",
             reply_markup=back_button()
         )
     elif user_id == ADMIN_ID:
@@ -896,15 +896,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     db['codes'][code]['status'] = 'approved'
                     referrer_id = db['users'].get(str(user_id), {}).get('referred_by')
                     if referrer_id and str(referrer_id) in db['users']:
-                        commission = int(reward * db['settings']['referral_rate'])
+                        commission = round(reward * db['settings']['referral_rate'], 4)
                         db['users'][str(referrer_id)]['referral_commission'] = db['users'][str(referrer_id)].get('referral_commission', 0) + commission
                         db['users'][str(referrer_id)]['balance'] = db['users'][str(referrer_id)].get('balance', 0) + commission
                         await context.bot.send_message(
                             referrer_id,
                             f"🎉 *Referral Commission*\n\n"
                             f"Your referral (User {user_id}) had code `{code}` approved!\n"
-                            f"Commission: +{commission} points ({commission * 0.001:.3f} USDT)\n"
-                            f"New balance: {db['users'][str(referrer_id)]['balance']} points",
+                            f"Commission: +{commission:.4f} points ({commission * 0.001:.6f} USDT)\n"
+                            f"New balance: {db['users'][str(referrer_id)]['balance']:.4f} points",
                             parse_mode="Markdown"
                         )
                     await context.bot.send_message(
@@ -924,23 +924,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id = db['codes'][code]['user_id']
                 reward = db['settings']['reward_per_code']
                 if str(user_id) in db['users']:
-                    # FIX: Add points to user's balance
+                    # Add points to user's balance
                     db['users'][str(user_id)]['balance'] = db['users'][str(user_id)].get('balance', 0) + reward
                     db['users'][str(user_id)]['total_earned'] = db['users'][str(user_id)].get('total_earned', 0) + reward
                     db['codes'][code]['status'] = 'approved'
+                    
+                    # Process referral commission
                     referrer_id = db['users'].get(str(user_id), {}).get('referred_by')
                     if referrer_id and str(referrer_id) in db['users']:
-                        commission = int(reward * db['settings']['referral_rate'])
+                        commission = round(reward * db['settings']['referral_rate'], 4)
                         db['users'][str(referrer_id)]['referral_commission'] = db['users'][str(referrer_id)].get('referral_commission', 0) + commission
                         db['users'][str(referrer_id)]['balance'] = db['users'][str(referrer_id)].get('balance', 0) + commission
+                        
                         await context.bot.send_message(
                             referrer_id,
                             f"🎉 *Referral Commission*\n\n"
                             f"Your referral (User {user_id}) had code `{code}` approved!\n"
-                            f"Commission: +{commission} points ({commission * 0.001:.3f} USDT)\n"
-                            f"New balance: {db['users'][str(referrer_id)]['balance']} points",
+                            f"Commission: +{commission:.4f} points ({commission * 0.001:.6f} USDT)\n"
+                            f"New balance: {db['users'][str(referrer_id)]['balance']:.4f} points",
                             parse_mode="Markdown"
                         )
+                    
                     save_db(db)
                     await query.edit_message_text(
                         f"✅ Code `{code}` approved! User received {reward} points.",
@@ -1134,7 +1138,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ *Withdrawal Request Created*\n\n"
                 f"Points: `{points}`\n"
                 f"Amount: `{points * 0.001:.3f}` USDT\n"
-                f"Address: `{address}`\极速赛车"
+                f"Address: `{address}`\n"
                 "_Waiting for server approval..._",
                 parse_mode="Markdown",
                 reply_markup=back_button()
