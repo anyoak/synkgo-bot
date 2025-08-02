@@ -448,12 +448,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not joined:
         # Join check buttons with message
-        keyboard = InlineKeyboardMarkup([
+        keyboard = InlineKeyboardMarkup(
             [
                 InlineKeyboardButton("Join @SynkGo", url="https://t.me/SynkGo"),
                 InlineKeyboardButton("Join @SynkGoPay", url="https://t.me/SynkGoPay")
             ])
-        
         await update.message.reply_text(
             "⚠️ *Channel Membership Required*\n\n"
             "To use this bot, you must join our official channels:\n"
