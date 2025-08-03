@@ -91,6 +91,7 @@ def init_db():
         "users": {},
         "codes": {},
         "withdrawals": {},
+        "gift_codes": {},  # New storage for gift codes
         "settings": {
             "reward_per_code": 2,
             "referral_rate": 0.05,
@@ -181,6 +182,7 @@ def user_panel():
         [InlineKeyboardButton("📋 Generate Code", url="https://t.me/+LtWJmPi8I2tkNjQ1")],
         [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw_start")],
         [InlineKeyboardButton("👥 Referral Program", callback_data="invite_panel")],
+        [InlineKeyboardButton("🎁 Gift Code", callback_data="gift_code_panel")],  # New button
         [InlineKeyboardButton("📊 My Statistics", callback_data="user_stats")],
         [InlineKeyboardButton("🆘 Support", url="https://t.me/SynkGoChat")]
     ])
@@ -193,6 +195,7 @@ def admin_panel():
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
         [InlineKeyboardButton("📊 System Stats", callback_data="admin_stats")],
         [InlineKeyboardButton("💼 Wallet Balance", callback_data="admin_wallet_balance")],
+        [InlineKeyboardButton("🎁 Gift Codes", callback_data="admin_gift_codes")],  # New button
         [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
     ])
 
@@ -473,7 +476,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌟 *Welcome to @SynkGo Rewards Bot!* 🌟\n\n"
         "💰 _Earn points by submitting codes_\n"
         "💸 _Withdraw USDT directly to your wallet_\n"
-        "👥 _Invite friends for referral bonuses_\n\n"
+        "👥 _Invite friends for referral bonuses_\n"
+        "🎁 _Claim gift codes for bonus points_\n\n"  # Updated message
         "📝 To submit a code, use /code command\n"
         "Example: `/code ABC12345`\n\n"
         f"💡 Tip: Each approved code earns you {db['settings']['reward_per_code']} points (1 point = 0.001 USDT)",
@@ -661,6 +665,44 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID")
+    # New /create command for gift codes
+    elif command == "/create" and len(args) >= 3:
+        try:
+            code = args[0].upper()
+            points = int(args[1])
+            max_claims = int(args[2])
+            
+            # Validate code format
+            if not re.match(r'^[A-Z0-9]{5,15}$', code):
+                await update.message.reply_text("❌ Invalid code format! Use 5-15 uppercase letters/numbers")
+                return
+                
+            # Check if code already exists
+            if code in db['gift_codes']:
+                await update.message.reply_text("❌ Gift code already exists")
+                return
+                
+            # Create new gift code
+            db['gift_codes'][code] = {
+                "points": points,
+                "max_claims": max_claims,
+                "claims": 0,
+                "created_at": time.time(),
+                "created_by": user_id,
+                "users_claimed": []
+            }
+            save_db(db)
+            
+            await update.message.reply_text(
+                f"✅ Gift code created!\n\n"
+                f"Code: `{code}`\n"
+                f"Points: {points}\n"
+                f"Max claims: {max_claims}\n"
+                f"Created by: {user_id}",
+                parse_mode="Markdown"
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid format. Use: /create [CODE] [POINTS] [MAX_CLAIMS]")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -723,6 +765,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📨 Codes Submitted Today: {submissions}/30\n"
             f"👥 Referrals: {len(user.get('referrals', []))}\n"
             f"🎯 Referral Commission: {user.get('referral_commission', 0):.4f} points",
+            reply_markup=back_button()
+        )
+    # New gift code panel
+    elif data == "gift_code_panel":
+        await query.edit_message_text(
+            "🎁 *Gift Code Center*\n\n"
+            "Enter a gift code to claim your points!\n\n"
+            "Example: `SYNK500`\n\n"
+            "💡 _You can only claim each gift code once_",
+            parse_mode="Markdown",
             reply_markup=back_button()
         )
     elif user_id == ADMIN_ID:
@@ -916,6 +968,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_points = sum(u['balance'] for u in db['users'].values())
             pending_codes = sum(1 for c in db['codes'].values() if c['status'] == 'pending')
             pending_wds = sum(1 for w in db['withdrawals'].values() if w['status'] == 'pending')
+            gift_codes = len(db['gift_codes'])
             await query.edit_message_text(
                 f"📊 *System Statistics*\n\n"
                 f"• Total users: `{total_users}`\n"
@@ -923,9 +976,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Total points in circulation: `{total_points}`\n"
                 f"• Pending codes: `{pending_codes}`\n"
                 f"• Pending withdrawals: `{pending_wds}`\n"
+                f"• Active gift codes: `{gift_codes}`\n"
                 f"• Last updated: {time.ctime()}",
                 parse_mode="Markdown",
                 reply_markup=admin_panel()
+            )
+        # New gift code management
+        elif data == "admin_gift_codes":
+            db = load_db()
+            if not db['gift_codes']:
+                await query.edit_message_text("❌ No active gift codes", reply_markup=admin_back_button())
+                return
+                
+            message = "🎁 *Active Gift Codes*\n\n"
+            for code, details in db['gift_codes'].items():
+                created_time = time.strftime("%Y-%m-%d", time.localtime(details['created_at']))
+                message += (
+                    f"• `{code}`: {details['points']} points\n"
+                    f"  Claims: {details['claims']}/{details['max_claims']}\n"
+                    f"  Created: {created_time} by {details['created_by']}\n\n"
+                )
+            await query.edit_message_text(
+                message,
+                parse_mode="Markdown",
+                reply_markup=admin_back_button()
             )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -934,6 +1008,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Your account has been banned. Contact @ZenEspt.")
         return
     text = update.message.text.strip()
+    
+    # Withdrawal request handling
     if text and len(text.split()) >= 2:
         parts = text.split()
         try:
@@ -1042,6 +1118,83 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ Invalid format. Use: [POINTS] [WALLET_ADDRESS]",
                 reply_markup=back_button()
             )
+    
+    # Gift code claiming
+    elif text and len(text.split()) == 1:
+        code = text.upper()
+        db = load_db()
+        
+        # Create user if not exists
+        if str(user_id) not in db['users']:
+            db['users'][str(user_id)] = {
+                "balance": 0,
+                "codes_submitted": [],
+                "submission_count": 0,
+                "last_submission": 0,
+                "referral_code": f"REF{user_id}",
+                "referred_by": None,
+                "referrals": [],
+                "referral_commission": 0,
+                "total_earned": 0,
+                "withdrawals": 0,
+                "banned": False
+            }
+        
+        # Check if gift code exists
+        if code not in db['gift_codes']:
+            await update.message.reply_text(
+                "❌ Invalid gift code",
+                reply_markup=back_button()
+            )
+            return
+            
+        gift = db['gift_codes'][code]
+        
+        # Check claim limits
+        if gift['claims'] >= gift['max_claims']:
+            await update.message.reply_text(
+                "❌ This gift code has reached its claim limit",
+                reply_markup=back_button()
+            )
+            return
+            
+        # Check if user already claimed
+        if user_id in gift['users_claimed']:
+            await update.message.reply_text(
+                "❌ You've already claimed this gift code",
+                reply_markup=back_button()
+            )
+            return
+            
+        # Process claim
+        user = db['users'][str(user_id)]
+        points = gift['points']
+        
+        user['balance'] += points
+        user['total_earned'] += points
+        gift['claims'] += 1
+        gift['users_claimed'].append(user_id)
+        
+        save_db(db)
+        
+        await update.message.reply_text(
+            f"🎉 *Gift Code Claimed!*\n\n"
+            f"You received *{points}* points!\n"
+            f"New balance: *{user['balance']}* points",
+            parse_mode="Markdown",
+            reply_markup=back_button()
+        )
+        
+        # Notify admin
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"🎁 Gift Code Claimed\n\n"
+            f"User: `{user_id}`\n"
+            f"Code: `{code}`\n"
+            f"Points: {points}\n"
+            f"Claims: {gift['claims']}/{gift['max_claims']}",
+            parse_mode="Markdown"
+        )
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1129,6 +1282,7 @@ def main():
     application.add_handler(CommandHandler("settings", admin_command))
     application.add_handler(CommandHandler("maintenance", admin_command))
     application.add_handler(CommandHandler("check", admin_command))
+    application.add_handler(CommandHandler("create", admin_command))  # New gift code command
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|approve_|reject_)"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
