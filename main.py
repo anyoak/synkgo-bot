@@ -209,7 +209,7 @@ def admin_back_button():
 # Check if user is banned
 def is_banned(user_id: int):
     db = load_db()
-    user = db['users'].get(str(user_id), {}
+    user = db['users'].get(str(user_id), {})
     return user.get('banned', False)
 
 # Calculate active referrals
