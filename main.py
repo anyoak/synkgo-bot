@@ -4,6 +4,7 @@ import time
 import re
 import logging
 import threading
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -91,7 +92,7 @@ def init_db():
         "users": {},
         "codes": {},
         "withdrawals": {},
-        "gift_codes": {},  # New storage for gift codes
+        "gift_codes": {},
         "settings": {
             "reward_per_code": 2,
             "referral_rate": 0.05,
@@ -182,7 +183,7 @@ def user_panel():
         [InlineKeyboardButton("📋 Generate Code", url="https://t.me/+LtWJmPi8I2tkNjQ1")],
         [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw_start")],
         [InlineKeyboardButton("👥 Referral Program", callback_data="invite_panel")],
-        [InlineKeyboardButton("🎁 Gift Code", callback_data="gift_code_panel")],  # New button
+        [InlineKeyboardButton("🎁 Gift Code", callback_data="gift_code_panel")],
         [InlineKeyboardButton("📊 My Statistics", callback_data="user_stats")],
         [InlineKeyboardButton("🆘 Support", url="https://t.me/SynkGoChat")]
     ])
@@ -195,7 +196,7 @@ def admin_panel():
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
         [InlineKeyboardButton("📊 System Stats", callback_data="admin_stats")],
         [InlineKeyboardButton("💼 Wallet Balance", callback_data="admin_wallet_balance")],
-        [InlineKeyboardButton("🎁 Gift Codes", callback_data="admin_gift_codes")],  # New button
+        [InlineKeyboardButton("🎁 Gift Codes", callback_data="admin_gift_codes")],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
     ])
 
@@ -208,7 +209,7 @@ def admin_back_button():
 # Check if user is banned
 def is_banned(user_id: int):
     db = load_db()
-    user = db['users'].get(str(user_id), {})
+    user = db['users'].get(str(user_id), {}
     return user.get('banned', False)
 
 # Calculate active referrals
@@ -477,7 +478,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 _Earn points by submitting codes_\n"
         "💸 _Withdraw USDT directly to your wallet_\n"
         "👥 _Invite friends for referral bonuses_\n"
-        "🎁 _Claim gift codes for bonus points_\n\n"  # Updated message
+        "🎁 _Claim gift codes for bonus points_\n\n"
         "📝 To submit a code, use /code command\n"
         "Example: `/code ABC12345`\n\n"
         f"💡 Tip: Each approved code earns you {db['settings']['reward_per_code']} points (1 point = 0.001 USDT)",
@@ -665,7 +666,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID")
-    # New /create command for gift codes
     elif command == "/create" and len(args) >= 3:
         try:
             code = args[0].upper()
@@ -703,6 +703,77 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except ValueError:
             await update.message.reply_text("❌ Invalid format. Use: /create [CODE] [POINTS] [MAX_CLAIMS]")
+    # New /refact command
+    elif command == "/refact" and len(args) >= 1:
+        try:
+            target_id = int(args[0])
+            referrer = db['users'].get(str(target_id))
+            
+            if not referrer:
+                await update.message.reply_text("❌ User not found")
+                return
+            
+            # Get settings
+            settings = db['settings']
+            reward_per_code = settings['reward_per_code']
+            referral_rate = settings['referral_rate']
+            
+            # Calculate date range (past 10 days)
+            today = datetime.now()
+            date_range = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(10)]
+            date_range.reverse()  # Show from oldest to newest
+            
+            # Prepare response
+            response = f"📊 *Referral Activity Report for User {target_id}*\n\n"
+            response += "Date       | Active Ref | Total Commission\n"
+            response += "----------------------------------------\n"
+            
+            # Calculate daily stats
+            for date_str in date_range:
+                # Convert date string to timestamp range
+                start_time = int(datetime.strptime(date_str, "%Y-%m-%d").timestamp())
+                end_time = start_time + 86400  # 24 hours later
+                
+                active_referrals = 0
+                daily_commission = 0.0
+                
+                # Check each referral
+                for ref_id in referrer.get('referrals', []):
+                    ref_user = db['users'].get(str(ref_id))
+                    if not ref_user:
+                        continue
+                    
+                    # Count daily submissions
+                    daily_submissions = sum(
+                        1 for code_data in db['codes'].values()
+                        if code_data.get('user_id') == ref_id
+                        and start_time <= code_data.get('timestamp', 0) < end_time
+                        and code_data.get('status') == 'approved'
+                    )
+                    
+                    # Check if active (30+ submissions)
+                    if daily_submissions >= 30:
+                        active_referrals += 1
+                    
+                    # Calculate commission
+                    daily_commission += daily_submissions * reward_per_code * referral_rate
+                
+                # Format daily stats
+                response += f"{date_str} | {active_referrals:>2}         | {daily_commission:.4f} points\n"
+            
+            # Add summary
+            total_referrals = len(referrer.get('referrals', []))
+            total_commission = referrer.get('referral_commission', 0)
+            
+            response += "\n💎 *Summary*\n"
+            response += f"Total Referrals: {total_referrals}\n"
+            response += f"Lifetime Commission: {total_commission:.4f} points\n"
+            response += f"Current Balance: {referrer.get('balance', 0):.4f} points"
+            
+            await update.message.reply_text(response, parse_mode="Markdown")
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -767,7 +838,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎯 Referral Commission: {user.get('referral_commission', 0):.4f} points",
             reply_markup=back_button()
         )
-    # New gift code panel
     elif data == "gift_code_panel":
         await query.edit_message_text(
             "🎁 *Gift Code Center*\n\n"
@@ -981,7 +1051,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=admin_panel()
             )
-        # New gift code management
         elif data == "admin_gift_codes":
             db = load_db()
             if not db['gift_codes']:
@@ -1282,7 +1351,8 @@ def main():
     application.add_handler(CommandHandler("settings", admin_command))
     application.add_handler(CommandHandler("maintenance", admin_command))
     application.add_handler(CommandHandler("check", admin_command))
-    application.add_handler(CommandHandler("create", admin_command))  # New gift code command
+    application.add_handler(CommandHandler("create", admin_command))
+    application.add_handler(CommandHandler("refact", admin_command))  # New command
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|approve_|reject_)"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
