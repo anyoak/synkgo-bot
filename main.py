@@ -4,6 +4,7 @@ import time
 import re
 import logging
 import threading
+import asyncio
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
@@ -11,6 +12,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
+import portalocker
 
 # Setup logging
 logging.basicConfig(
@@ -107,7 +109,8 @@ def init_db():
             logger.info("Creating new database file")
             os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
             with open(DB_FILE, 'w') as f:
-                json.dump(default_db, f, indent=2)
+                with portalocker.Lock(f.fileno(), timeout=10):
+                    json.dump(default_db, f, indent=2)
             logger.info("Database file created successfully")
         else:
             logger.info("Database file already exists")
@@ -120,7 +123,8 @@ def load_db():
     try:
         if os.path.exists(DB_FILE):
             with open(DB_FILE) as f:
-                return json.load(f)
+                with portalocker.Lock(f.fileno(), timeout=10):
+                    return json.load(f)
         else:
             init_db()
             return load_db()
@@ -132,10 +136,12 @@ def load_db():
 def save_db(data):
     try:
         with open(DB_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
+            with portalocker.Lock(f.fileno(), timeout=10):
+                json.dump(data, f, indent=2)
         logger.info("Database saved successfully")
     except Exception as e:
         logger.error(f"Failed to save database: {e}")
+        raise ValueError(f"Database save failed: {e}")
 
 # Gas optimization
 def get_gas_price():
@@ -158,10 +164,10 @@ def send_usdt(to_address, amount_usdt):
         })
         signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
         tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        logger.info(f"USDT transfer successful: {tx_hash.hex()}")
+        logger.info(f"USDT transfer initiated: {tx_hash.hex()} to {to_address} for {amount_usdt} USDT")
         return tx_hash.hex()
     except Exception as e:
-        logger.error(f"Transaction failed: {e}")
+        logger.error(f"Transaction failed: {e}, to_address={to_address}, amount={amount_usdt}")
         return None
 
 # Check wallet balance
@@ -258,7 +264,11 @@ def process_code_submission(user_id: int, code: str):
     user['last_submission'] = current_time
     user['submission_count'] = user.get('submission_count', 0) + 1
     db['users'][str(user_id)] = user
-    save_db(db)
+    try:
+        save_db(db)
+    except ValueError as e:
+        logger.error(f"Database save error during code submission: {e}")
+        return "❌ Database error, please try again later."
     return (
         f"✅ Code submitted successfully!\n\n"
         f"Code: `{code}`\n"
@@ -268,10 +278,16 @@ def process_code_submission(user_id: int, code: str):
 
 # Reject withdrawal and refund points
 async def reject_withdrawal(context: ContextTypes.DEFAULT_TYPE, withdrawal_id: str):
-    db = load_db()
-    withdrawal = db['withdrawals'].get(withdrawal_id)
-    
-    if withdrawal and withdrawal['status'] == 'pending':
+    try:
+        db = load_db()
+        withdrawal = db['withdrawals'].get(withdrawal_id)
+        
+        if not withdrawal:
+            return False
+        
+        if withdrawal['status'] != 'pending':
+            return False
+        
         user_id = withdrawal['user_id']
         points = withdrawal['points']
         
@@ -279,37 +295,44 @@ async def reject_withdrawal(context: ContextTypes.DEFAULT_TYPE, withdrawal_id: s
         if str(user_id) in db['users']:
             db['users'][str(user_id)]['balance'] += points
             withdrawal['status'] = 'rejected'
-            save_db(db)
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during rejection: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during rejection: {e}",
+                    parse_mode="Markdown"
+                )
+                return False
             
             await context.bot.send_message(
                 user_id,
-                f"❌ Withdrawal Rejected\n\n"
+                f"❌ *Withdrawal Rejected*\n\n"
                 f"ID: `{withdrawal_id}`\n"
                 f"Amount: {points} points refunded\n"
                 f"New balance: {db['users'][str(user_id)]['balance']} points",
                 parse_mode="Markdown"
             )
             return True
-    return False
+        return False
+    except Exception as e:
+        logger.error(f"Error rejecting withdrawal {withdrawal_id}: {e}")
+        return False
 
 # Process withdrawal and send USDT
 async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE, withdrawal_id: str):
     try:
-        # Notify processing started
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"🔄 Transaction creating for withdrawal `{withdrawal_id}`...",
-            parse_mode="Markdown"
-        )
-        
         db = load_db()
         withdrawal = db['withdrawals'].get(withdrawal_id)
         
         if not withdrawal:
-            await update.callback_query.answer("Withdrawal not found")
+            await update.callback_query.edit_message_text(
+                "❌ Withdrawal not found",
+                reply_markup=admin_panel()
+            )
             return
         
-        # Check if already processed
         if withdrawal['status'] != 'pending':
             await update.callback_query.edit_message_text(
                 f"⚠️ Withdrawal already processed: {withdrawal['status']}",
@@ -317,24 +340,31 @@ async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )
             return
         
-        # Mark as processing immediately
+        # Mark as processing
         withdrawal['status'] = 'processing'
-        save_db(db)
+        try:
+            save_db(db)
+        except ValueError as e:
+            await update.callback_query.edit_message_text(
+                f"❌ Database error: {e}",
+                reply_markup=admin_panel()
+            )
+            return
         
         user_id = withdrawal['user_id']
         points = withdrawal['points']
         address = withdrawal['address']
         amount_usdt = points * 0.001
 
-        # Check hot wallet balance
+        # Check wallet balance
         balance = get_wallet_balance()
         
-        # 1. Check USDT balance
         if balance['usdt'] < amount_usdt:
-            # Revert status to pending
             withdrawal['status'] = 'pending'
-            save_db(db)
-            
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during balance check: {e}")
             await context.bot.send_message(
                 ADMIN_ID,
                 f"⚠️ *INSUFFICIENT USDT* ⚠️\n\n"
@@ -350,12 +380,12 @@ async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )
             return
         
-        # 2. Check BNB balance for gas
         if balance['bnb'] < 0.001:
-            # Revert status to pending
             withdrawal['status'] = 'pending'
-            save_db(db)
-            
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during gas check: {e}")
             await context.bot.send_message(
                 ADMIN_ID,
                 f"⚠️ *INSUFFICIENT GAS* ⚠️\n\n"
@@ -371,58 +401,83 @@ async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )
             return
         
-        # Attempt transaction
-        tx_hash = send_usdt(address, amount_usdt)
-        
-        if tx_hash:
-            # Success
-            withdrawal['status'] = "completed"
-            withdrawal['tx_hash'] = tx_hash
-            save_db(db)
-            
-            # Notify user
-            await context.bot.send_message(
-                user_id,
-                f"✅ *Withdrawal Completed*\n\n"
-                f"Amount: `{amount_usdt:.3f}` USDT\n"
-                f"TX Hash: `{tx_hash}`\n"
-                f"View: https://bscscan.com/tx/{tx_hash}",
-                parse_mode="Markdown"
-            )
-            
-            # Notify admin
-            await update.callback_query.edit_message_text(
-                f"✅ Success!\nTX Hash: `{tx_hash}`",
-                parse_mode="Markdown",
-                reply_markup=admin_panel()
-            )
-        else:
-            # Transaction failed - refund points
-            withdrawal['status'] = 'failed'
-            save_db(db)
-            
-            # Refund points to user
-            if str(user_id) in db['users']:
+        # Attempt transaction with retries
+        max_retries = 3
+        retry_delay = 5  # seconds
+        for attempt in range(max_retries):
+            try:
+                tx_hash = send_usdt(address, amount_usdt)
+                if tx_hash:
+                    # Wait for transaction confirmation
+                    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                    if receipt['status'] == 1:
+                        withdrawal['status'] = 'completed'
+                        withdrawal['tx_hash'] = tx_hash
+                        db['users'][str(user_id)]['withdrawals'] = db['users'][str(user_id)].get('withdrawals', 0) + 1
+                        try:
+                            save_db(db)
+                        except ValueError as e:
+                            logger.error(f"Database save error after successful tx: {e}")
+                            await context.bot.send_message(
+                                ADMIN_ID,
+                                f"⚠️ *Critical Error*: Transaction succeeded but database save failed: {e}",
+                                parse_mode="Markdown"
+                            )
+                            return
+                        
+                        await context.bot.send_message(
+                            user_id,
+                            f"✅ *Withdrawal Completed*\n\n"
+                            f"Amount: `{amount_usdt:.3f}` USDT\n"
+                            f"TX Hash: `{tx_hash}`\n"
+                            f"View: https://bscscan.com/tx/{tx_hash}",
+                            parse_mode="Markdown"
+                        )
+                        await update.callback_query.edit_message_text(
+                            f"✅ Success!\nTX Hash: `{tx_hash}`",
+                            parse_mode="Markdown",
+                            reply_markup=admin_panel()
+                        )
+                        return
+                    else:
+                        raise ValueError("Transaction failed on blockchain")
+                else:
+                    raise ValueError("Transaction hash not received")
+            except Exception as e:
+                logger.error(f"Transaction attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                # Refund points on final failure
+                withdrawal['status'] = 'failed'
                 db['users'][str(user_id)]['balance'] += points
-                save_db(db)
-                
+                try:
+                    save_db(db)
+                except ValueError as e:
+                    logger.error(f"Database save error during refund: {e}")
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ *Critical Error*: Transaction failed and database save failed during refund: {e}",
+                        parse_mode="Markdown"
+                    )
+                    return
                 await context.bot.send_message(
                     user_id,
-                    f"❌ Withdrawal Failed\n\n"
+                    f"❌ *Withdrawal Failed*\n\n"
                     f"ID: `{withdrawal_id}`\n"
                     f"Amount: {points} points refunded\n"
                     f"Reason: Transaction error",
                     parse_mode="Markdown"
                 )
-            
-            await update.callback_query.edit_message_text(
-                "❌ Transaction failed! Points refunded.",
-                reply_markup=admin_panel()
-            )
+                await update.callback_query.edit_message_text(
+                    f"❌ Transaction failed: {e}. Points refunded.",
+                    reply_markup=admin_panel()
+                )
+                return
     except Exception as e:
         logger.error(f"Withdrawal processing error: {e}")
         await update.callback_query.edit_message_text(
-            "❌ Critical error during processing!",
+            f"❌ Critical error during processing: {e}",
             reply_markup=admin_panel()
         )
 
@@ -450,14 +505,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
     if context.args:
         ref_code = context.args[0]
-        # Only process if user doesn't have a referrer yet
         if not db['users'][str(user_id)].get('referred_by'):
             for uid, user_data in db['users'].items():
                 if user_data.get('referral_code') == ref_code and int(uid) != user_id:
                     if user_id not in user_data.get('referrals', []):
                         db['users'][uid]['referrals'] = user_data.get('referrals', []) + [user_id]
                         db['users'][str(user_id)]['referred_by'] = int(uid)
-                        save_db(db)
+                        try:
+                            save_db(db)
+                        except ValueError as e:
+                            logger.error(f"Database save error during referral: {e}")
+                            await context.bot.send_message(
+                                ADMIN_ID,
+                                f"⚠️ *Critical Error*: Failed to save database during referral: {e}",
+                                parse_mode="Markdown"
+                            )
+                            return
                         await update.message.reply_text(
                             f"🎉 *Joined via Referral*\n\n"
                             f"You joined using `{ref_code}`!\n"
@@ -472,7 +535,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             parse_mode="Markdown"
                         )
                         break
-    save_db(db)
+    try:
+        save_db(db)
+    except ValueError as e:
+        logger.error(f"Database save error during start: {e}")
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"⚠️ *Critical Error*: Failed to save database during start: {e}",
+            parse_mode="Markdown"
+        )
+        return
     await update.message.reply_text(
         "🌟 *Welcome to @SynkGo Rewards Bot!* 🌟\n\n"
         "💰 _Earn points by submitting codes_\n"
@@ -492,7 +564,6 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Your account has been banned. Contact @ZenEspt.")
         return
     
-    # Validate command format
     if not context.args or len(context.args) < 1:
         await update.message.reply_text(
             "❌ Please provide a code after the command.\n"
@@ -503,10 +574,8 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = context.args[0].strip()
     response = process_code_submission(user_id, code)
     
-    # Send confirmation to user
     await update.message.reply_text(response, parse_mode="Markdown")
     
-    # Send notification to admin if submission was successful
     if "✅" in response:
         user = update.effective_user
         username = f"@{user.username}" if user.username else user.first_name
@@ -550,7 +619,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = int(args[1])
             reason = " ".join(args[2:]) if len(args) > 2 else "No reason provided"
             if str(target_id) not in db['users']:
-                # Create user if doesn't exist
                 db['users'][str(target_id)] = {
                     "balance": 0,
                     "codes_submitted": [],
@@ -566,7 +634,16 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 }
             db['users'][str(target_id)]['balance'] += amount
             db['users'][str(target_id)]['total_earned'] += amount
-            save_db(db)
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during adjust: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during adjust: {e}",
+                    parse_mode="Markdown"
+                )
+                return
             await update.message.reply_text(
                 f"✅ Adjusted balance for user {target_id}\n"
                 f"Amount: {amount} points\n"
@@ -592,7 +669,16 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ User not found")
                 return
             db['users'][str(target_id)]['banned'] = True
-            save_db(db)
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during ban: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during ban: {e}",
+                    parse_mode="Markdown"
+                )
+                return
             await update.message.reply_text(f"✅ User {target_id} banned\nReason: {reason}")
             await context.bot.send_message(
                 target_id,
@@ -612,7 +698,16 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ User not found")
                 return
             db['users'][str(target_id)]['banned'] = False
-            save_db(db)
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during unban: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during unban: {e}",
+                    parse_mode="Markdown"
+                )
+                return
             await update.message.reply_text(f"✅ User {target_id} unbanned\nReason: {reason}")
             await context.bot.send_message(
                 target_id,
@@ -632,7 +727,16 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Invalid setting name")
                 return
             db['settings'][setting_name] = new_value
-            save_db(db)
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during settings update: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during settings update: {e}",
+                    parse_mode="Markdown"
+                )
+                return
             await update.message.reply_text(
                 f"✅ Setting updated\n"
                 f"{setting_name}: {new_value}"
@@ -642,12 +746,20 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif command == "/maintenance":
         new_status = "maintenance" if db['settings']['bot_status'] == "active" else "active"
         db['settings']['bot_status'] = new_status
-        save_db(db)
+        try:
+            save_db(db)
+        except ValueError as e:
+            logger.error(f"Database save error during maintenance toggle: {e}")
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"⚠️ *Critical Error*: Failed to save database during maintenance toggle: {e}",
+                parse_mode="Markdown"
+            )
+            return
         await update.message.reply_text(f"✅ Bot status changed to: {new_status}")
     elif command == "/check" and len(args) >= 1:
         try:
             target_id = int(args[0])
-            db = load_db()
             user = db['users'].get(str(target_id), {})
             points = user.get('balance', 0)
             usdt_value = points * 0.001
@@ -672,17 +784,14 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             points = int(args[1])
             max_claims = int(args[2])
             
-            # Validate code format
             if not re.match(r'^[A-Z0-9]{5,15}$', code):
                 await update.message.reply_text("❌ Invalid code format! Use 5-15 uppercase letters/numbers")
                 return
                 
-            # Check if code already exists
             if code in db['gift_codes']:
                 await update.message.reply_text("❌ Gift code already exists")
                 return
                 
-            # Create new gift code
             db['gift_codes'][code] = {
                 "points": points,
                 "max_claims": max_claims,
@@ -691,7 +800,16 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "created_by": user_id,
                 "users_claimed": []
             }
-            save_db(db)
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during gift code creation: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during gift code creation: {e}",
+                    parse_mode="Markdown"
+                )
+                return
             
             await update.message.reply_text(
                 f"✅ Gift code created!\n\n"
@@ -703,7 +821,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except ValueError:
             await update.message.reply_text("❌ Invalid format. Use: /create [CODE] [POINTS] [MAX_CLAIMS]")
-    # New /refact command
     elif command == "/refact" and len(args) >= 1:
         try:
             target_id = int(args[0])
@@ -713,37 +830,30 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ User not found")
                 return
             
-            # Get settings
             settings = db['settings']
             reward_per_code = settings['reward_per_code']
             referral_rate = settings['referral_rate']
             
-            # Calculate date range (past 10 days)
             today = datetime.now()
             date_range = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(10)]
-            date_range.reverse()  # Show from oldest to newest
+            date_range.reverse()
             
-            # Prepare response
             response = f"📊 *Referral Activity Report for User {target_id}*\n\n"
             response += "Date       | Active Ref | Total Commission\n"
             response += "----------------------------------------\n"
             
-            # Calculate daily stats
             for date_str in date_range:
-                # Convert date string to timestamp range
                 start_time = int(datetime.strptime(date_str, "%Y-%m-%d").timestamp())
-                end_time = start_time + 86400  # 24 hours later
+                end_time = start_time + 86400
                 
                 active_referrals = 0
                 daily_commission = 0.0
                 
-                # Check each referral
                 for ref_id in referrer.get('referrals', []):
                     ref_user = db['users'].get(str(ref_id))
                     if not ref_user:
                         continue
                     
-                    # Count daily submissions
                     daily_submissions = sum(
                         1 for code_data in db['codes'].values()
                         if code_data.get('user_id') == ref_id
@@ -751,17 +861,13 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         and code_data.get('status') == 'approved'
                     )
                     
-                    # Check if active (30+ submissions)
                     if daily_submissions >= 30:
                         active_referrals += 1
                     
-                    # Calculate commission
                     daily_commission += daily_submissions * reward_per_code * referral_rate
                 
-                # Format daily stats
                 response += f"{date_str} | {active_referrals:>2}         | {daily_commission:.4f} points\n"
             
-            # Add summary
             total_referrals = len(referrer.get('referrals', []))
             total_commission = referrer.get('referral_commission', 0)
             
@@ -915,7 +1021,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="Markdown"
                     )
                     approved_count += 1
-            save_db(db)
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during approve all codes: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during approve all codes: {e}",
+                    parse_mode="Markdown"
+                )
+                return
             await query.edit_message_text(f"✅ Approved {approved_count} codes", reply_markup=admin_panel())
         elif data.startswith("approve_code:"):
             code = data.split(":")[1]
@@ -923,18 +1038,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id = db['codes'][code]['user_id']
                 reward = db['settings']['reward_per_code']
                 if str(user_id) in db['users']:
-                    # Add points to user's balance
                     db['users'][str(user_id)]['balance'] = db['users'][str(user_id)].get('balance', 0) + reward
                     db['users'][str(user_id)]['total_earned'] = db['users'][str(user_id)].get('total_earned', 0) + reward
                     db['codes'][code]['status'] = 'approved'
-                    
-                    # Process referral commission
                     referrer_id = db['users'].get(str(user_id), {}).get('referred_by')
                     if referrer_id and str(referrer_id) in db['users']:
                         commission = round(reward * db['settings']['referral_rate'], 4)
                         db['users'][str(referrer_id)]['referral_commission'] = db['users'][str(referrer_id)].get('referral_commission', 0) + commission
                         db['users'][str(referrer_id)]['balance'] = db['users'][str(referrer_id)].get('balance', 0) + commission
-                        
                         await context.bot.send_message(
                             referrer_id,
                             f"🎉 *Referral Commission*\n\n"
@@ -943,8 +1054,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"New balance: {db['users'][str(referrer_id)]['balance']:.4f} points",
                             parse_mode="Markdown"
                         )
-                    
-                    save_db(db)
+                    try:
+                        save_db(db)
+                    except ValueError as e:
+                        logger.error(f"Database save error during code approval: {e}")
+                        await context.bot.send_message(
+                            ADMIN_ID,
+                            f"⚠️ *Critical Error*: Failed to save database during code approval: {e}",
+                            parse_mode="Markdown"
+                        )
+                        return
                     await query.edit_message_text(
                         f"✅ Code `{code}` approved! User received {reward} points.",
                         reply_markup=admin_panel()
@@ -966,7 +1085,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if code in db['codes'] and db['codes'][code]['status'] == 'pending':
                 user_id = db['codes'][code]['user_id']
                 db['codes'][code]['status'] = 'rejected'
-                save_db(db)
+                try:
+                    save_db(db)
+                except ValueError as e:
+                    logger.error(f"Database save error during code rejection: {e}")
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ *Critical Error*: Failed to save database during code rejection: {e}",
+                        parse_mode="Markdown"
+                    )
+                    return
                 await query.edit_message_text(f"❌ Code `{code}` rejected", reply_markup=admin_panel())
                 await context.bot.send_message(
                     user_id,
@@ -1052,7 +1180,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=admin_panel()
             )
         elif data == "admin_gift_codes":
-            db = load_db()
             if not db['gift_codes']:
                 await query.edit_message_text("❌ No active gift codes", reply_markup=admin_back_button())
                 return
@@ -1078,7 +1205,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     
-    # Withdrawal request handling
     if text and len(text.split()) >= 2:
         parts = text.split()
         try:
@@ -1086,7 +1212,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             address = ' '.join(parts[1:])
             db = load_db()
             
-            # Create user if not exists
             if str(user_id) not in db['users']:
                 db['users'][str(user_id)] = {
                     "balance": 0,
@@ -1105,7 +1230,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user = db['users'][str(user_id)]
             min_withdraw = db['settings']['min_withdraw']
             
-            # Validate minimum
             if points < min_withdraw:
                 await update.message.reply_text(
                     f"❌ Minimum withdrawal is {min_withdraw} points",
@@ -1113,7 +1237,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # Check existing pending withdrawals
             pending_withdrawals = [
                 wd for wd in db['withdrawals'].values() 
                 if wd['user_id'] == user_id and wd['status'] == 'pending'
@@ -1126,7 +1249,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # Check balance
             if points > user['balance']:
                 await update.message.reply_text(
                     "❌ Insufficient balance",
@@ -1134,7 +1256,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # Validate address
             if not Web3.is_address(address):
                 await update.message.reply_text(
                     "❌ Invalid wallet address format",
@@ -1142,11 +1263,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # Deduct balance immediately
             user['balance'] -= points
             withdrawal_id = f"wd_{int(time.time())}_{user_id}"
             
-            # Create withdrawal record
             db['withdrawals'][withdrawal_id] = {
                 "user_id": user_id,
                 "points": points,
@@ -1154,7 +1273,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "status": "pending",
                 "timestamp": time.time()
             }
-            save_db(db)
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during withdrawal creation: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during withdrawal creation: {e}",
+                    parse_mode="Markdown"
+                )
+                return
             
             await update.message.reply_text(
                 f"✅ *Withdrawal Request Created*\n\n"
@@ -1166,7 +1294,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=back_button()
             )
             
-            # Notify admin
             await context.bot.send_message(
                 ADMIN_ID,
                 f"⚠️ *New Withdrawal Request*\n\n"
@@ -1188,12 +1315,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=back_button()
             )
     
-    # Gift code claiming
     elif text and len(text.split()) == 1:
         code = text.upper()
         db = load_db()
         
-        # Create user if not exists
         if str(user_id) not in db['users']:
             db['users'][str(user_id)] = {
                 "balance": 0,
@@ -1209,7 +1334,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "banned": False
             }
         
-        # Check if gift code exists
         if code not in db['gift_codes']:
             await update.message.reply_text(
                 "❌ Invalid gift code",
@@ -1219,7 +1343,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         gift = db['gift_codes'][code]
         
-        # Check claim limits
         if gift['claims'] >= gift['max_claims']:
             await update.message.reply_text(
                 "❌ This gift code has reached its claim limit",
@@ -1227,7 +1350,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
             
-        # Check if user already claimed
         if user_id in gift['users_claimed']:
             await update.message.reply_text(
                 "❌ You've already claimed this gift code",
@@ -1235,7 +1357,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
             
-        # Process claim
         user = db['users'][str(user_id)]
         points = gift['points']
         
@@ -1244,7 +1365,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gift['claims'] += 1
         gift['users_claimed'].append(user_id)
         
-        save_db(db)
+        try:
+            save_db(db)
+        except ValueError as e:
+            logger.error(f"Database save error during gift code claim: {e}")
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"⚠️ *Critical Error*: Failed to save database during gift code claim: {e}",
+                parse_mode="Markdown"
+            )
+            return
         
         await update.message.reply_text(
             f"🎉 *Gift Code Claimed!*\n\n"
@@ -1254,7 +1384,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_button()
         )
         
-        # Notify admin
         await context.bot.send_message(
             ADMIN_ID,
             f"🎁 Gift Code Claimed\n\n"
@@ -1275,12 +1404,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db = load_db()
         withdrawal = db['withdrawals'].get(withdrawal_id, {})
         
-        # Prevent duplicate processing
         if withdrawal.get('status') != 'pending':
-            await query.answer("Already processed!")
+            await query.edit_message_text(
+                f"⚠️ Withdrawal already processed: {withdrawal.get('status', 'unknown')}",
+                reply_markup=admin_panel()
+            )
             return
         
-        # Disable buttons immediately
         await query.edit_message_reply_markup(reply_markup=None)
         await query.edit_message_text(
             f"🔄 Processing withdrawal `{withdrawal_id}`...",
@@ -1292,16 +1422,56 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("reject_wd:"):
         withdrawal_id = data.split(":")[1]
         if await reject_withdrawal(context, withdrawal_id):
-            await query.edit_message_text(f"❌ Withdrawal {withdrawal_id} rejected")
+            await query.edit_message_text(
+                f"❌ Withdrawal `{withdrawal_id}` rejected",
+                reply_markup=admin_panel()
+            )
         else:
-            await query.edit_message_text("❌ Withdrawal not found")
+            await query.edit_message_text(
+                "❌ Withdrawal not found or already processed",
+                reply_markup=admin_panel()
+            )
 
-# Error handler fixed
+async def check_stuck_withdrawals(context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    current_time = time.time()
+    stuck_threshold = 3600  # 1 hour
+    
+    for wd_id, withdrawal in db['withdrawals'].items():
+        if withdrawal['status'] == 'processing' and (current_time - withdrawal['timestamp']) > stuck_threshold:
+            user_id = withdrawal['user_id']
+            points = withdrawal['points']
+            withdrawal['status'] = 'failed'
+            db['users'][str(user_id)]['balance'] += points
+            try:
+                save_db(db)
+                await context.bot.send_message(
+                    user_id,
+                    f"❌ *Withdrawal Failed*\n\n"
+                    f"ID: `{wd_id}`\n"
+                    f"Amount: {points} points refunded\n"
+                    f"Reason: Processing timeout",
+                    parse_mode="Markdown"
+                )
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Stuck Withdrawal Detected*\n\n"
+                    f"ID: `{wd_id}`\n"
+                    f"User: `{user_id}`\n"
+                    f"Points refunded: {points}",
+                    parse_mode="Markdown"
+                )
+            except ValueError as e:
+                logger.error(f"Database save error during stuck withdrawal handling: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to handle stuck withdrawal {wd_id}: {e}",
+                    parse_mode="Markdown"
+                )
+
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         logger.error(f"Error: {context.error}", exc_info=context.error)
-        
-        # Only respond if we have a valid message
         if update and update.effective_message:
             await update.effective_message.reply_text(
                 "⚠️ An error occurred. Please try again later."
@@ -1311,7 +1481,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in error handler: {e}")
 
-# Health check server for port binding
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -1333,7 +1502,6 @@ def main():
         logger.error(f"Failed to initialize database: {e}")
         return
     
-    # Start health server in a separate thread if PORT is set
     if 'PORT' in os.environ:
         health_thread = threading.Thread(target=run_health_server, daemon=True)
         health_thread.start()
@@ -1341,7 +1509,6 @@ def main():
     
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("code", code_command))
     application.add_handler(CommandHandler("admin", admin_command))
@@ -1352,13 +1519,15 @@ def main():
     application.add_handler(CommandHandler("maintenance", admin_command))
     application.add_handler(CommandHandler("check", admin_command))
     application.add_handler(CommandHandler("create", admin_command))
-    application.add_handler(CommandHandler("refact", admin_command))  # New command
+    application.add_handler(CommandHandler("refact", admin_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|approve_|reject_)"))
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|approve_wd:|reject_wd:)"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
     
-    # Start the bot using polling
+    application.job_queue.run_repeating(check_stuck_withdrawals, interval=600, first=60)
+    
     logger.info("Starting bot...")
     application.run_polling()
 
