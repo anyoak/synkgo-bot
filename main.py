@@ -28,6 +28,7 @@ ADMIN_ID = int(os.getenv('ADMIN_ID'))
 PRIVATE_KEY = os.getenv('PRIVATE_KEY')
 BSC_RPC = os.getenv('BSC_RPC')
 USDT_CONTRACT = os.getenv('USDT_CONTRACT')
+MOD_LOG_CHANNEL = int(os.getenv('MOD_LOG_CHANNEL', 2368794492))  # Default channel ID
 
 # Initialize Web3
 w3 = Web3(Web3.HTTPProvider(BSC_RPC))
@@ -95,6 +96,7 @@ def init_db():
         "codes": {},
         "withdrawals": {},
         "gift_codes": {},
+        "moderators": {},  # New moderators section
         "settings": {
             "reward_per_code": 2,
             "referral_rate": 0.05,
@@ -203,6 +205,14 @@ def admin_panel():
         [InlineKeyboardButton("📊 System Stats", callback_data="admin_stats")],
         [InlineKeyboardButton("💼 Wallet Balance", callback_data="admin_wallet_balance")],
         [InlineKeyboardButton("🎁 Gift Codes", callback_data="admin_gift_codes")],
+        [InlineKeyboardButton("👮 Moderators", callback_data="admin_moderators")],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
+    ])
+
+def moderator_panel():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Pending Codes", callback_data="mod_pending_codes")],
+        [InlineKeyboardButton("📋 My Approvals", callback_data="mod_my_approvals")],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")]
     ])
 
@@ -212,11 +222,19 @@ def back_button():
 def admin_back_button():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")]])
 
+def mod_back_button():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Mod Panel", callback_data="mod_panel")]])
+
 # Check if user is banned
 def is_banned(user_id: int):
     db = load_db()
     user = db['users'].get(str(user_id), {})
     return user.get('banned', False)
+
+# Check if user is moderator
+def is_moderator(user_id: int):
+    db = load_db()
+    return str(user_id) in db['moderators'] and db['moderators'][str(user_id)].get('status') == 'active'
 
 # Calculate active referrals
 def get_active_referrals_count(user_id, db):
@@ -259,7 +277,9 @@ def process_code_submission(user_id: int, code: str):
     db['codes'][code] = {
         "status": "pending",
         "user_id": user_id,
-        "timestamp": current_time
+        "timestamp": current_time,
+        "moderator_id": None,  # Track which mod processed
+        "processed_at": None   # When it was processed
     }
     user['last_submission'] = current_time
     user['submission_count'] = user.get('submission_count', 0) + 1
@@ -480,6 +500,35 @@ async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"❌ Critical error during processing: {e}",
             reply_markup=admin_panel()
         )
+
+# Log moderation action to channel
+async def log_mod_action(context: ContextTypes.DEFAULT_TYPE, mod_id: int, action: str, code: str, user_id: int, points: int = None):
+    try:
+        mod_user = await context.bot.get_chat(mod_id)
+        mod_name = mod_user.username or mod_user.first_name
+        
+        target_user = await context.bot.get_chat(user_id)
+        target_name = target_user.username or target_user.first_name
+        
+        message = (
+            f"🔰 *Moderation Action*\n\n"
+            f"• Moderator: [{mod_name}](tg://user?id={mod_id}) (ID: `{mod_id}`)\n"
+            f"• Action: {'Approved' if action == 'approve' else 'Rejected'}\n"
+            f"• Code: `{code}`\n"
+            f"• User: [{target_name}](tg://user?id={user_id}) (ID: `{user_id}`)"
+        )
+        
+        if action == 'approve' and points:
+            message += f"\n• Reward: {points} points"
+        
+        await context.bot.send_message(
+            chat_id=MOD_LOG_CHANNEL,
+            text=message,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Failed to log moderation action: {e}")
 
 # Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -880,6 +929,77 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID")
+    # Moderator management commands
+    elif command == "/addmod" and len(args) >= 1:
+        try:
+            mod_id = int(args[0])
+            if str(mod_id) in db['moderators']:
+                await update.message.reply_text("✅ This user is already a moderator")
+                return
+                
+            db['moderators'][str(mod_id)] = {
+                "added_by": user_id,
+                "added_at": time.time(),
+                "status": "active"
+            }
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during mod add: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during mod add: {e}",
+                    parse_mode="Markdown"
+                )
+                return
+                
+            await update.message.reply_text(f"✅ Added moderator: {mod_id}")
+            await context.bot.send_message(
+                mod_id,
+                "🎉 *Moderator Access Granted*\n\n"
+                "You have been added as a moderator!\n"
+                "You can now approve/reject user codes.\n\n"
+                "Use /mod to access the moderator panel.",
+                parse_mode="Markdown"
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID format")
+    elif command == "/banmod" and len(args) >= 1:
+        try:
+            mod_id = int(args[0])
+            if str(mod_id) not in db['moderators']:
+                await update.message.reply_text("❌ This user is not a moderator")
+                return
+                
+            db['moderators'][str(mod_id)]['status'] = 'inactive'
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during mod ban: {e}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Failed to save database during mod ban: {e}",
+                    parse_mode="Markdown"
+                )
+                return
+                
+            await update.message.reply_text(f"✅ Moderator {mod_id} deactivated")
+            await context.bot.send_message(
+                mod_id,
+                "⚠️ *Moderator Access Revoked*\n\n"
+                "Your moderator privileges have been revoked.",
+                parse_mode="Markdown"
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID format")
+
+# Moderator command
+async def mod_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_moderator(user_id):
+        await update.message.reply_text("❌ You don't have moderator access")
+        return
+    await update.message.reply_text("👮 *Moderator Panel*", parse_mode="Markdown", reply_markup=moderator_panel())
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -897,6 +1017,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=user_panel()
         )
+    elif data == "mod_panel":
+        if is_moderator(user_id):
+            await query.edit_message_text(
+                "👮 *Moderator Panel*",
+                parse_mode="Markdown",
+                reply_markup=moderator_panel()
+            )
     elif data == "withdraw_start":
         min_withdraw = db['settings']['min_withdraw']
         await query.edit_message_text(
@@ -953,14 +1080,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=back_button()
         )
-    elif user_id == ADMIN_ID:
-        if data == "admin_panel":
+    elif user_id == ADMIN_ID or is_moderator(user_id):
+        if data == "admin_panel" and user_id == ADMIN_ID:
             await query.edit_message_text(
                 "👑 *Admin Panel*",
                 parse_mode="Markdown",
                 reply_markup=admin_panel()
             )
-        elif data == "admin_wallet_balance":
+        elif data == "mod_pending_codes" and is_moderator(user_id):
+            pending_codes = [code for code, data in db['codes'].items() if data['status'] == 'pending']
+            if not pending_codes:
+                await query.edit_message_text("✅ No pending codes to approve", reply_markup=moderator_panel())
+                return
+            message = "📝 *Pending Codes*\n\n"
+            keyboard = []
+            for i, code in enumerate(pending_codes[:10]):
+                user_id = db['codes'][code]['user_id']
+                message += f"{i+1}. `{code}` (User: {user_id})\n"
+                keyboard.append([InlineKeyboardButton(f"✅ Approve {code}", callback_data=f"approve_code:{code}")])
+                keyboard.append([InlineKeyboardButton(f"❌ Reject {code}", callback_data=f"reject_code:{code}")])
+            keyboard.append([InlineKeyboardButton("🔙 Mod Panel", callback_data="mod_panel")])
+            await query.edit_message_text(
+                message,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        elif data == "mod_my_approvals" and is_moderator(user_id):
+            mod_codes = [code for code, data in db['codes'].items() 
+                        if data.get('moderator_id') == user_id 
+                        and data['status'] in ['approved', 'rejected']]
+            if not mod_codes:
+                await query.edit_message_text("📝 You haven't processed any codes yet", reply_markup=moderator_panel())
+                return
+            message = "📋 *Your Moderation History*\n\n"
+            for code in mod_codes[:20]:
+                code_data = db['codes'][code]
+                status_icon = "✅" if code_data['status'] == 'approved' else "❌"
+                timestamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(code_data['processed_at']))
+                message += f"{status_icon} `{code}` ({timestamp})\n"
+            await query.edit_message_text(
+                message,
+                parse_mode="Markdown",
+                reply_markup=mod_back_button()
+            )
+        elif data == "admin_wallet_balance" and user_id == ADMIN_ID:
             balance = get_wallet_balance()
             await query.edit_message_text(
                 f"💼 *Hot Wallet Balance*\n\n"
@@ -970,7 +1133,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=admin_panel()
             )
-        elif data == "admin_pending_codes":
+        elif data == "admin_pending_codes" and user_id == ADMIN_ID:
             pending_codes = [code for code, data in db['codes'].items() if data['status'] == 'pending']
             if not pending_codes:
                 await query.edit_message_text("✅ No pending codes to approve", reply_markup=admin_panel())
@@ -989,7 +1152,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-        elif data == "approve_all_codes":
+        elif data == "approve_all_codes" and user_id == ADMIN_ID:
             pending_codes = [code for code, data in db['codes'].items() if data['status'] == 'pending']
             approved_count = 0
             for code in pending_codes:
@@ -999,6 +1162,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     db['users'][str(user_id)]['balance'] = db['users'][str(user_id)].get('balance', 0) + reward
                     db['users'][str(user_id)]['total_earned'] = db['users'][str(user_id)].get('total_earned', 0) + reward
                     db['codes'][code]['status'] = 'approved'
+                    db['codes'][code]['moderator_id'] = ADMIN_ID
+                    db['codes'][code]['processed_at'] = time.time()
                     referrer_id = db['users'].get(str(user_id), {}).get('referred_by')
                     if referrer_id and str(referrer_id) in db['users']:
                         commission = round(reward * db['settings']['referral_rate'], 4)
@@ -1021,6 +1186,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="Markdown"
                     )
                     approved_count += 1
+                    # Log to channel
+                    await log_mod_action(context, ADMIN_ID, 'approve', code, user_id, reward)
             try:
                 save_db(db)
             except ValueError as e:
@@ -1035,12 +1202,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("approve_code:"):
             code = data.split(":")[1]
             if code in db['codes'] and db['codes'][code]['status'] == 'pending':
+                # Check if already processed by another mod
+                if db['codes'][code].get('moderator_id') is not None:
+                    await query.answer("❌ This code is already being processed by another moderator", show_alert=True)
+                    return
+                    
+                # Mark as being processed by this mod
+                db['codes'][code]['moderator_id'] = user_id
+                try:
+                    save_db(db)
+                except ValueError as e:
+                    logger.error(f"Database save error during code lock: {e}")
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ *Critical Error*: Failed to save database during code lock: {e}",
+                        parse_mode="Markdown"
+                    )
+                    return
+                    
                 user_id = db['codes'][code]['user_id']
                 reward = db['settings']['reward_per_code']
                 if str(user_id) in db['users']:
                     db['users'][str(user_id)]['balance'] = db['users'][str(user_id)].get('balance', 0) + reward
                     db['users'][str(user_id)]['total_earned'] = db['users'][str(user_id)].get('total_earned', 0) + reward
                     db['codes'][code]['status'] = 'approved'
+                    db['codes'][code]['processed_at'] = time.time()
                     referrer_id = db['users'].get(str(user_id), {}).get('referred_by')
                     if referrer_id and str(referrer_id) in db['users']:
                         commission = round(reward * db['settings']['referral_rate'], 4)
@@ -1064,12 +1250,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             parse_mode="Markdown"
                         )
                         return
+                    # Log to channel
+                    await log_mod_action(context, user_id, 'approve', code, user_id, reward)
+                    
+                    if user_id == ADMIN_ID:
+                        panel = admin_panel()
+                    else:
+                        panel = moderator_panel()
+                        
                     await query.edit_message_text(
                         f"✅ Code `{code}` approved! User received {reward} points.",
-                        reply_markup=admin_panel()
+                        reply_markup=panel
                     )
                     await context.bot.send_message(
-                        user_id,
+                        db['codes'][code]['user_id'],
                         f"🎉 *Code Approved*\n\n"
                         f"Code: `{code}` has been validated!\n"
                         f"Reward: +{reward} points ({reward * 0.001:.3f} USDT)\n"
@@ -1077,14 +1271,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="Markdown"
                     )
                 else:
-                    await query.edit_message_text("❌ User not found", reply_markup=admin_panel())
+                    await query.edit_message_text("❌ User not found", reply_markup=moderator_panel() if is_moderator(user_id) else admin_panel())
             else:
-                await query.edit_message_text("❌ Code not found or already approved", reply_markup=admin_panel())
+                await query.edit_message_text("❌ Code not found or already approved", reply_markup=moderator_panel() if is_moderator(user_id) else admin_panel())
         elif data.startswith("reject_code:"):
             code = data.split(":")[1]
             if code in db['codes'] and db['codes'][code]['status'] == 'pending':
+                # Check if already processed by another mod
+                if db['codes'][code].get('moderator_id') is not None:
+                    await query.answer("❌ This code is already being processed by another moderator", show_alert=True)
+                    return
+                    
+                # Mark as being processed by this mod
+                db['codes'][code]['moderator_id'] = user_id
+                try:
+                    save_db(db)
+                except ValueError as e:
+                    logger.error(f"Database save error during code lock: {e}")
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ *Critical Error*: Failed to save database during code lock: {e}",
+                        parse_mode="Markdown"
+                    )
+                    return
+                    
                 user_id = db['codes'][code]['user_id']
                 db['codes'][code]['status'] = 'rejected'
+                db['codes'][code]['processed_at'] = time.time()
                 try:
                     save_db(db)
                 except ValueError as e:
@@ -1095,7 +1308,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="Markdown"
                     )
                     return
-                await query.edit_message_text(f"❌ Code `{code}` rejected", reply_markup=admin_panel())
+                # Log to channel
+                await log_mod_action(context, user_id, 'reject', code, user_id)
+                
+                if user_id == ADMIN_ID:
+                    panel = admin_panel()
+                else:
+                    panel = moderator_panel()
+                    
+                await query.edit_message_text(
+                    f"❌ Code `{code}` rejected", 
+                    reply_markup=panel
+                )
                 await context.bot.send_message(
                     user_id,
                     f"❌ *Code Rejected*\n\n"
@@ -1104,8 +1328,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
             else:
-                await query.edit_message_text("❌ Code not found or already processed", reply_markup=admin_panel())
-        elif data == "admin_pending_withdrawals":
+                await query.edit_message_text("❌ Code not found or already processed", reply_markup=moderator_panel() if is_moderator(user_id) else admin_panel())
+        elif data == "admin_pending_withdrawals" and user_id == ADMIN_ID:
             pending_wds = [wd_id for wd_id, data in db['withdrawals'].items() if data['status'] == 'pending']
             if not pending_wds:
                 await query.edit_message_text("✅ No pending withdrawals", reply_markup=admin_panel())
@@ -1131,7 +1355,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-        elif data == "admin_user_management":
+        elif data == "admin_user_management" and user_id == ADMIN_ID:
             await query.edit_message_text(
                 "👤 *User Management*\n\n"
                 "Select an action:",
@@ -1145,7 +1369,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")]
                 ])
             )
-        elif data == "admin_settings":
+        elif data == "admin_settings" and user_id == ADMIN_ID:
             settings = db['settings']
             await query.edit_message_text(
                 f"⚙️ *Bot Settings*\n\n"
@@ -1160,13 +1384,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=admin_panel()
             )
-        elif data == "admin_stats":
+        elif data == "admin_stats" and user_id == ADMIN_ID:
             total_users = len(db['users'])
             active_today = sum(1 for u in db['users'].values() if u.get('submission_count', 0) > 0)
             total_points = sum(u['balance'] for u in db['users'].values())
             pending_codes = sum(1 for c in db['codes'].values() if c['status'] == 'pending')
             pending_wds = sum(1 for w in db['withdrawals'].values() if w['status'] == 'pending')
             gift_codes = len(db['gift_codes'])
+            active_mods = sum(1 for m in db['moderators'].values() if m.get('status') == 'active')
             await query.edit_message_text(
                 f"📊 *System Statistics*\n\n"
                 f"• Total users: `{total_users}`\n"
@@ -1175,11 +1400,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Pending codes: `{pending_codes}`\n"
                 f"• Pending withdrawals: `{pending_wds}`\n"
                 f"• Active gift codes: `{gift_codes}`\n"
+                f"• Active moderators: `{active_mods}`\n"
                 f"• Last updated: {time.ctime()}",
                 parse_mode="Markdown",
                 reply_markup=admin_panel()
             )
-        elif data == "admin_gift_codes":
+        elif data == "admin_gift_codes" and user_id == ADMIN_ID:
             if not db['gift_codes']:
                 await query.edit_message_text("❌ No active gift codes", reply_markup=admin_back_button())
                 return
@@ -1192,6 +1418,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"  Claims: {details['claims']}/{details['max_claims']}\n"
                     f"  Created: {created_time} by {details['created_by']}\n\n"
                 )
+            await query.edit_message_text(
+                message,
+                parse_mode="Markdown",
+                reply_markup=admin_back_button()
+            )
+        elif data == "admin_moderators" and user_id == ADMIN_ID:
+            if not db['moderators']:
+                await query.edit_message_text("❌ No moderators added yet", reply_markup=admin_back_button())
+                return
+                
+            message = "👮 *Active Moderators*\n\n"
+            for mod_id, details in db['moderators'].items():
+                if details.get('status') == 'active':
+                    added_time = time.strftime("%Y-%m-%d", time.localtime(details['added_at']))
+                    message += (
+                        f"• User ID: `{mod_id}`\n"
+                        f"  Added by: `{details['added_by']}`\n"
+                        f"  Added on: {added_time}\n\n"
+                    )
             await query.edit_message_text(
                 message,
                 parse_mode="Markdown",
@@ -1520,9 +1765,11 @@ def main():
     application.add_handler(CommandHandler("check", admin_command))
     application.add_handler(CommandHandler("create", admin_command))
     application.add_handler(CommandHandler("refact", admin_command))
+    application.add_handler(CommandHandler("addmod", admin_command))
+    application.add_handler(CommandHandler("banmod", admin_command))
+    application.add_handler(CommandHandler("mod", mod_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|approve_wd:|reject_wd:)"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
     
