@@ -28,7 +28,8 @@ ADMIN_ID = int(os.getenv('ADMIN_ID'))
 PRIVATE_KEY = os.getenv('PRIVATE_KEY')
 BSC_RPC = os.getenv('BSC_RPC')
 USDT_CONTRACT = os.getenv('USDT_CONTRACT')
-MOD_LOG_CHANNEL = int(os.getenv('MOD_LOG_CHANNEL', 2368794492))  # Default channel ID
+PAYMENT_LOG_CHANNEL = int(os.getenv('PAYMENT_LOG_CHANNEL', 2700185457))  # SynkGoPay channel
+MOD_LOG_CHANNEL = int(os.getenv('MOD_LOG_CHANNEL', 2368794492))  # Default mod log channel
 
 # Initialize Web3
 w3 = Web3(Web3.HTTPProvider(BSC_RPC))
@@ -96,7 +97,7 @@ def init_db():
         "codes": {},
         "withdrawals": {},
         "gift_codes": {},
-        "moderators": {},  # New moderators section
+        "moderators": {},
         "settings": {
             "reward_per_code": 2,
             "referral_rate": 0.05,
@@ -193,13 +194,12 @@ def user_panel():
         [InlineKeyboardButton("👥 Referral Program", callback_data="invite_panel")],
         [InlineKeyboardButton("🎁 Gift Code", callback_data="gift_code_panel")],
         [InlineKeyboardButton("📊 My Statistics", callback_data="user_stats")],
-        [InlineKeyboardButton("🆘 Support", url="https://t.me/SynkGoChat")]
+        [InlineKeyboardButton("🆘 Support", url="https://t.me/ZenEspt")]
     ])
 
 def admin_panel():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 Pending Codes", callback_data="admin_pending_codes")],
-        [InlineKeyboardButton("✅ Approve Withdrawals", callback_data="admin_pending_withdrawals")],
         [InlineKeyboardButton("👤 User Management", callback_data="admin_user_management")],
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
         [InlineKeyboardButton("📊 System Stats", callback_data="admin_stats")],
@@ -260,7 +260,7 @@ def process_code_submission(user_id: int, code: str):
     settings = db['settings']
     user = db['users'].get(str(user_id), {})
     if user.get('banned', False):
-        return "❌ Your account has been banned. Contact support team."
+        return "❌ Your account has been banned. Contact @ZenEspt."
     if db['settings']['bot_status'] != 'active':
         return "⛔ Bot is currently under maintenance. Please try again later."
     if not re.match(r'^[A-Za-z0-9]{5,15}$', code):
@@ -278,8 +278,8 @@ def process_code_submission(user_id: int, code: str):
         "status": "pending",
         "user_id": user_id,
         "timestamp": current_time,
-        "moderator_id": None,  # Track which mod processed
-        "processed_at": None   # When it was processed
+        "moderator_id": None,
+        "processed_at": None
     }
     user['last_submission'] = current_time
     user['submission_count'] = user.get('submission_count', 0) + 1
@@ -296,210 +296,172 @@ def process_code_submission(user_id: int, code: str):
         f"⏳ _Review may take 5 minutes to 12 hours_"
     )
 
-# Reject withdrawal and refund points
-async def reject_withdrawal(context: ContextTypes.DEFAULT_TYPE, withdrawal_id: str):
+# Process withdrawal automatically
+async def process_withdrawal(context: ContextTypes.DEFAULT_TYPE, user_id: int, points: int, address: str):
+    db = load_db()
+    withdrawal_id = f"wd_{int(time.time())}_{user_id}"
+    
+    # Create withdrawal record
+    db['withdrawals'][withdrawal_id] = {
+        "user_id": user_id,
+        "points": points,
+        "address": address,
+        "status": "processing",
+        "timestamp": time.time()
+    }
     try:
-        db = load_db()
-        withdrawal = db['withdrawals'].get(withdrawal_id)
-        
-        if not withdrawal:
-            return False
-        
-        if withdrawal['status'] != 'pending':
-            return False
-        
-        user_id = withdrawal['user_id']
-        points = withdrawal['points']
-        
-        # Refund points
-        if str(user_id) in db['users']:
-            db['users'][str(user_id)]['balance'] += points
-            withdrawal['status'] = 'rejected'
-            try:
-                save_db(db)
-            except ValueError as e:
-                logger.error(f"Database save error during rejection: {e}")
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"⚠️ *Critical Error*: Failed to save database during rejection: {e}",
-                    parse_mode="Markdown"
-                )
-                return False
-            
-            await context.bot.send_message(
-                user_id,
-                f"❌ *Withdrawal Rejected*\n\n"
-                f"ID: `{withdrawal_id}`\n"
-                f"Amount: {points} points refunded\n"
-                f"New balance: {db['users'][str(user_id)]['balance']} points",
-                parse_mode="Markdown"
-            )
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Error rejecting withdrawal {withdrawal_id}: {e}")
+        save_db(db)
+    except ValueError as e:
+        logger.error(f"Database save error during withdrawal creation: {e}")
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"⚠️ *Critical Error*: Failed to save database during withdrawal creation: {e}",
+            parse_mode="Markdown"
+        )
         return False
 
-# Process withdrawal and send USDT
-async def process_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE, withdrawal_id: str):
-    try:
-        db = load_db()
-        withdrawal = db['withdrawals'].get(withdrawal_id)
-        
-        if not withdrawal:
-            await update.callback_query.edit_message_text(
-                "❌ Withdrawal not found",
-                reply_markup=admin_panel()
-            )
-            return
-        
-        if withdrawal['status'] != 'pending':
-            await update.callback_query.edit_message_text(
-                f"⚠️ Withdrawal already processed: {withdrawal['status']}",
-                reply_markup=admin_panel()
-            )
-            return
-        
-        # Mark as processing
-        withdrawal['status'] = 'processing'
+    amount_usdt = points * 0.001
+    balance = get_wallet_balance()
+
+    # Check wallet balance
+    if balance['usdt'] < amount_usdt:
+        db['users'][str(user_id)]['balance'] += points
+        db['withdrawals'][withdrawal_id]['status'] = 'failed'
         try:
             save_db(db)
         except ValueError as e:
-            await update.callback_query.edit_message_text(
-                f"❌ Database error: {e}",
-                reply_markup=admin_panel()
+            logger.error(f"Database save error during balance refund: {e}")
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"⚠️ *Critical Error*: Failed to save database during balance refund: {e}",
+                parse_mode="Markdown"
             )
-            return
-        
-        user_id = withdrawal['user_id']
-        points = withdrawal['points']
-        address = withdrawal['address']
-        amount_usdt = points * 0.001
+        await context.bot.send_message(
+            user_id,
+            f"❌ *Withdrawal Failed*\n\n"
+            f"Amount: `{points}` points\n"
+            f"Reason: Insufficient USDT in hot wallet\n\n"
+            f"Please contact @ZenEspt for assistance.",
+            parse_mode="Markdown"
+        )
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"⚠️ *INSUFFICIENT USDT* ⚠️\n\n"
+            f"Withdrawal ID: `{withdrawal_id}`\n"
+            f"User: `{user_id}`\n"
+            f"Required: `{amount_usdt:.3f}` USDT\n"
+            f"Available: `{balance['usdt']:.3f}` USDT\n\n"
+            f"Please fund: `{HOT_WALLET_ADDRESS}`",
+            parse_mode="Markdown"
+        )
+        return False
 
-        # Check wallet balance
-        balance = get_wallet_balance()
-        
-        if balance['usdt'] < amount_usdt:
-            withdrawal['status'] = 'pending'
-            try:
-                save_db(db)
-            except ValueError as e:
-                logger.error(f"Database save error during balance check: {e}")
+    if balance['bnb'] < 0.001:
+        db['users'][str(user_id)]['balance'] += points
+        db['withdrawals'][withdrawal_id]['status'] = 'failed'
+        try:
+            save_db(db)
+        except ValueError as e:
+            logger.error(f"Database save error during gas refund: {e}")
             await context.bot.send_message(
                 ADMIN_ID,
-                f"⚠️ *INSUFFICIENT USDT* ⚠️\n\n"
-                f"Withdrawal ID: `{withdrawal_id}`\n"
-                f"Required: `{amount_usdt:.3f}` USDT\n"
-                f"Available: `{balance['usdt']:.3f}` USDT\n\n"
-                f"Please fund: `{HOT_WALLET_ADDRESS}`",
+                f"⚠️ *Critical Error*: Failed to save database during gas refund: {e}",
                 parse_mode="Markdown"
             )
-            await update.callback_query.edit_message_text(
-                "❌ Failed: Insufficient USDT! Fund hot wallet.",
-                reply_markup=admin_panel()
-            )
-            return
-        
-        if balance['bnb'] < 0.001:
-            withdrawal['status'] = 'pending'
-            try:
-                save_db(db)
-            except ValueError as e:
-                logger.error(f"Database save error during gas check: {e}")
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"⚠️ *INSUFFICIENT GAS* ⚠️\n\n"
-                f"Withdrawal ID: `{withdrawal_id}`\n"
-                f"Required: >0.001 BNB\n"
-                f"Available: `{balance['bnb']:.6f}` BNB\n\n"
-                f"Please send BNB to: `{HOT_WALLET_ADDRESS}`",
-                parse_mode="Markdown"
-            )
-            await update.callback_query.edit_message_text(
-                "❌ Failed: Insufficient BNB for gas!",
-                reply_markup=admin_panel()
-            )
-            return
-        
-        # Attempt transaction with retries
-        max_retries = 3
-        retry_delay = 5  # seconds
-        for attempt in range(max_retries):
-            try:
-                tx_hash = send_usdt(address, amount_usdt)
-                if tx_hash:
-                    # Wait for transaction confirmation
-                    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-                    if receipt['status'] == 1:
-                        withdrawal['status'] = 'completed'
-                        withdrawal['tx_hash'] = tx_hash
-                        db['users'][str(user_id)]['withdrawals'] = db['users'][str(user_id)].get('withdrawals', 0) + 1
-                        try:
-                            save_db(db)
-                        except ValueError as e:
-                            logger.error(f"Database save error after successful tx: {e}")
-                            await context.bot.send_message(
-                                ADMIN_ID,
-                                f"⚠️ *Critical Error*: Transaction succeeded but database save failed: {e}",
-                                parse_mode="Markdown"
-                            )
-                            return
-                        
+        await context.bot.send_message(
+            user_id,
+            f"❌ *Withdrawal Failed*\n\n"
+            f"Amount: `{points}` points\n"
+            f"Reason: Insufficient BNB for gas in hot wallet\n\n"
+            f"Please contact @ZenEspt for assistance.",
+            parse_mode="Markdown"
+        )
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"⚠️ *INSUFFICIENT GAS* ⚠️\n\n"
+            f"Withdrawal ID: `{withdrawal_id}`\n"
+            f"User: `{user_id}`\n"
+            f"Required: >0.001 BNB\n"
+            f"Available: `{balance['bnb']:.6f}` BNB\n\n"
+            f"Please send BNB to: `{HOT_WALLET_ADDRESS}`",
+            parse_mode="Markdown"
+        )
+        return False
+
+    # Attempt transaction with retries
+    max_retries = 3
+    retry_delay = 5
+    for attempt in range(max_retries):
+        try:
+            tx_hash = send_usdt(address, amount_usdt)
+            if tx_hash:
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                if receipt['status'] == 1:
+                    db['withdrawals'][withdrawal_id]['status'] = 'completed'
+                    db['withdrawals'][withdrawal_id]['tx_hash'] = tx_hash
+                    db['users'][str(user_id)]['withdrawals'] = db['users'][str(user_id)].get('withdrawals', 0) + 1
+                    try:
+                        save_db(db)
+                    except ValueError as e:
+                        logger.error(f"Database save error after successful tx: {e}")
                         await context.bot.send_message(
-                            user_id,
-                            f"✅ *Withdrawal Completed*\n\n"
-                            f"Amount: `{amount_usdt:.3f}` USDT\n"
-                            f"TX Hash: `{tx_hash}`\n"
-                            f"View: https://bscscan.com/tx/{tx_hash}",
+                            ADMIN_ID,
+                            f"⚠️ *Critical Error*: Transaction succeeded but database save failed: {e}",
                             parse_mode="Markdown"
                         )
-                        await update.callback_query.edit_message_text(
-                            f"✅ Success!\nTX Hash: `{tx_hash}`",
-                            parse_mode="Markdown",
-                            reply_markup=admin_panel()
-                        )
-                        return
-                    else:
-                        raise ValueError("Transaction failed on blockchain")
-                else:
-                    raise ValueError("Transaction hash not received")
-            except Exception as e:
-                logger.error(f"Transaction attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    continue
-                # Refund points on final failure
-                withdrawal['status'] = 'failed'
-                db['users'][str(user_id)]['balance'] += points
-                try:
-                    save_db(db)
-                except ValueError as e:
-                    logger.error(f"Database save error during refund: {e}")
+                        return False
+                    
+                    user = await context.bot.get_chat(user_id)
+                    username = f"@{user.username}" if user.username else user.first_name
                     await context.bot.send_message(
-                        ADMIN_ID,
-                        f"⚠️ *Critical Error*: Transaction failed and database save failed during refund: {e}",
+                        user_id,
+                        f"✅ *Withdrawal Completed*\n\n"
+                        f"Amount: `{amount_usdt:.3f}` USDT\n"
+                        f"TX Hash: `{tx_hash}`\n"
+                        f"View: https://bscscan.com/tx/{tx_hash}",
                         parse_mode="Markdown"
                     )
-                    return
+                    await context.bot.send_message(
+                        PAYMENT_LOG_CHANNEL,
+                        f"💸 *Payment Processed*\n\n"
+                        f"User: [{username}](tg://user?id={user_id})\n"
+                        f"Amount: `{amount_usdt:.3f}` USDT\n"
+                        f"TX Hash: `{tx_hash}`\n"
+                        f"View: https://bscscan.com/tx/{tx_hash}",
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                    return True
+                else:
+                    raise ValueError("Transaction failed on blockchain")
+            else:
+                raise ValueError("Transaction hash not received")
+        except Exception as e:
+            logger.error(f"Transaction attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+                continue
+            db['users'][str(user_id)]['balance'] += points
+            db['withdrawals'][withdrawal_id]['status'] = 'failed'
+            try:
+                save_db(db)
+            except ValueError as e:
+                logger.error(f"Database save error during refund: {e}")
                 await context.bot.send_message(
-                    user_id,
-                    f"❌ *Withdrawal Failed*\n\n"
-                    f"ID: `{withdrawal_id}`\n"
-                    f"Amount: {points} points refunded\n"
-                    f"Reason: Transaction error",
+                    ADMIN_ID,
+                    f"⚠️ *Critical Error*: Transaction failed and database save failed during refund: {e}",
                     parse_mode="Markdown"
                 )
-                await update.callback_query.edit_message_text(
-                    f"❌ Transaction failed: {e}. Points refunded.",
-                    reply_markup=admin_panel()
-                )
-                return
-    except Exception as e:
-        logger.error(f"Withdrawal processing error: {e}")
-        await update.callback_query.edit_message_text(
-            f"❌ Critical error during processing: {e}",
-            reply_markup=admin_panel()
-        )
+            await context.bot.send_message(
+                user_id,
+                f"❌ *Withdrawal Failed*\n\n"
+                f"Amount: `{points}` points refunded\n"
+                f"Reason: Transaction error\n\n"
+                f"Please contact @ZenEspt for assistance.",
+                parse_mode="Markdown"
+            )
+            return False
+    return False
 
 # Log moderation action to channel
 async def log_mod_action(context: ContextTypes.DEFAULT_TYPE, mod_id: int, action: str, code: str, user_id: int, points: int = None):
@@ -929,7 +891,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID")
-    # Moderator management commands
     elif command == "/addmod" and len(args) >= 1:
         try:
             mod_id = int(args[0])
@@ -993,7 +954,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID format")
 
-# Moderator command
 async def mod_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_moderator(user_id):
@@ -1186,7 +1146,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="Markdown"
                     )
                     approved_count += 1
-                    # Log to channel
                     await log_mod_action(context, ADMIN_ID, 'approve', code, user_id, reward)
             try:
                 save_db(db)
@@ -1202,12 +1161,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("approve_code:"):
             code = data.split(":")[1]
             if code in db['codes'] and db['codes'][code]['status'] == 'pending':
-                # Check if already processed by another mod
                 if db['codes'][code].get('moderator_id') is not None:
                     await query.answer("❌ This code is already being processed by another moderator", show_alert=True)
                     return
                     
-                # Mark as being processed by this mod
                 db['codes'][code]['moderator_id'] = user_id
                 try:
                     save_db(db)
@@ -1250,7 +1207,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             parse_mode="Markdown"
                         )
                         return
-                    # Log to channel
                     await log_mod_action(context, user_id, 'approve', code, user_id, reward)
                     
                     if user_id == ADMIN_ID:
@@ -1277,12 +1233,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("reject_code:"):
             code = data.split(":")[1]
             if code in db['codes'] and db['codes'][code]['status'] == 'pending':
-                # Check if already processed by another mod
                 if db['codes'][code].get('moderator_id') is not None:
                     await query.answer("❌ This code is already being processed by another moderator", show_alert=True)
                     return
                     
-                # Mark as being processed by this mod
                 db['codes'][code]['moderator_id'] = user_id
                 try:
                     save_db(db)
@@ -1308,7 +1262,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="Markdown"
                     )
                     return
-                # Log to channel
                 await log_mod_action(context, user_id, 'reject', code, user_id)
                 
                 if user_id == ADMIN_ID:
@@ -1329,32 +1282,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await query.edit_message_text("❌ Code not found or already processed", reply_markup=moderator_panel() if is_moderator(user_id) else admin_panel())
-        elif data == "admin_pending_withdrawals" and user_id == ADMIN_ID:
-            pending_wds = [wd_id for wd_id, data in db['withdrawals'].items() if data['status'] == 'pending']
-            if not pending_wds:
-                await query.edit_message_text("✅ No pending withdrawals", reply_markup=admin_panel())
-                return
-            message = "📝 *Pending Withdrawals*\n\n"
-            keyboard = []
-            for wd_id in pending_wds[:5]:
-                wd = db['withdrawals'][wd_id]
-                usdt_amount = wd['points'] * 0.001
-                message += (
-                    f"• ID: `{wd_id}`\n"
-                    f" User: {wd['user_id']}\n"
-                    f" Amount: {usdt_amount:.3f} USDT\n"
-                    f" Address: `{wd['address']}`\n\n"
-                )
-                keyboard.append([
-                    InlineKeyboardButton(f"✅ Approve {wd_id}", callback_data=f"approve_wd:{wd_id}"),
-                    InlineKeyboardButton(f"❌ Reject {wd_id}", callback_data=f"reject_wd:{wd_id}")
-                ])
-            keyboard.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")])
-            await query.edit_message_text(
-                message,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
         elif data == "admin_user_management" and user_id == ADMIN_ID:
             await query.edit_message_text(
                 "👤 *User Management*\n\n"
@@ -1509,51 +1436,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             user['balance'] -= points
-            withdrawal_id = f"wd_{int(time.time())}_{user_id}"
-            
-            db['withdrawals'][withdrawal_id] = {
-                "user_id": user_id,
-                "points": points,
-                "address": address,
-                "status": "pending",
-                "timestamp": time.time()
-            }
             try:
                 save_db(db)
             except ValueError as e:
-                logger.error(f"Database save error during withdrawal creation: {e}")
+                logger.error(f"Database save error during withdrawal initiation: {e}")
                 await context.bot.send_message(
                     ADMIN_ID,
-                    f"⚠️ *Critical Error*: Failed to save database during withdrawal creation: {e}",
+                    f"⚠️ *Critical Error*: Failed to save database during withdrawal initiation: {e}",
                     parse_mode="Markdown"
                 )
                 return
             
             await update.message.reply_text(
-                f"✅ *Withdrawal Request Created*\n\n"
+                f"🔄 *Processing Withdrawal*\n\n"
                 f"Points: `{points}`\n"
                 f"Amount: `{points * 0.001:.3f}` USDT\n"
                 f"Address: `{address}`\n"
-                "_Waiting for server approval..._",
+                f"_Please wait for transaction confirmation..._",
                 parse_mode="Markdown",
                 reply_markup=back_button()
             )
             
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"⚠️ *New Withdrawal Request*\n\n"
-                f"User: `{user_id}`\n"
-                f"Points: `{points}`\n"
-                f"Amount: `{points * 0.001:.3f}` USDT\n"
-                f"Address: `{address}`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve_wd:{withdrawal_id}"),
-                        InlineKeyboardButton("❌ Reject", callback_data=f"reject_wd:{withdrawal_id}")
-                    ]
-                ])
-            )
+            success = await process_withdrawal(context, user_id, points, address)
+            if not success:
+                await update.message.reply_text(
+                    f"❌ *Withdrawal Failed*\n\n"
+                    f"Points: `{points}` refunded\n"
+                    f"Reason: Transaction error or insufficient funds\n\n"
+                    f"Please contact @ZenEspt for assistance.",
+                    parse_mode="Markdown",
+                    reply_markup=back_button()
+                )
+                
         except ValueError:
             await update.message.reply_text(
                 "❌ Invalid format. Use: [POINTS] [WALLET_ADDRESS]",
@@ -1639,48 +1553,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    
-    if data.startswith("approve_wd:"):
-        withdrawal_id = data.split(":")[1]
-        db = load_db()
-        withdrawal = db['withdrawals'].get(withdrawal_id, {})
-        
-        if withdrawal.get('status') != 'pending':
-            await query.edit_message_text(
-                f"⚠️ Withdrawal already processed: {withdrawal.get('status', 'unknown')}",
-                reply_markup=admin_panel()
-            )
-            return
-        
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.edit_message_text(
-            f"🔄 Processing withdrawal `{withdrawal_id}`...",
-            parse_mode="Markdown"
-        )
-        
-        await process_withdrawal(update, context, withdrawal_id)
-    
-    elif data.startswith("reject_wd:"):
-        withdrawal_id = data.split(":")[1]
-        if await reject_withdrawal(context, withdrawal_id):
-            await query.edit_message_text(
-                f"❌ Withdrawal `{withdrawal_id}` rejected",
-                reply_markup=admin_panel()
-            )
-        else:
-            await query.edit_message_text(
-                "❌ Withdrawal not found or already processed",
-                reply_markup=admin_panel()
-            )
-
 async def check_stuck_withdrawals(context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     current_time = time.time()
-    stuck_threshold = 3600  # 1 hour
+    stuck_threshold = 3600
     
     for wd_id, withdrawal in db['withdrawals'].items():
         if withdrawal['status'] == 'processing' and (current_time - withdrawal['timestamp']) > stuck_threshold:
@@ -1695,7 +1571,8 @@ async def check_stuck_withdrawals(context: ContextTypes.DEFAULT_TYPE):
                     f"❌ *Withdrawal Failed*\n\n"
                     f"ID: `{wd_id}`\n"
                     f"Amount: {points} points refunded\n"
-                    f"Reason: Processing timeout",
+                    f"Reason: Processing timeout\n\n"
+                    f"Please contact @ZenEspt for assistance.",
                     parse_mode="Markdown"
                 )
                 await context.bot.send_message(
@@ -1769,7 +1646,6 @@ def main():
     application.add_handler(CommandHandler("banmod", admin_command))
     application.add_handler(CommandHandler("mod", mod_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|approve_wd:|reject_wd:)"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
     
