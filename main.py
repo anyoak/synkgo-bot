@@ -151,7 +151,7 @@ def get_gas_price():
     db = load_db()
     return w3.to_wei(db['settings']['gas_price'], 'gwei')
 
-# USDT transfer function
+# USDT transfer function - FIXED TRANSACTION SIGNING
 def send_usdt(to_address, amount_usdt):
     try:
         to_address = Web3.to_checksum_address(to_address)
@@ -166,7 +166,8 @@ def send_usdt(to_address, amount_usdt):
             'gas': 90000
         })
         signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        # FIX: Changed raw_transaction to rawTransaction
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
         logger.info(f"USDT transfer initiated: {tx_hash.hex()} to {to_address} for {amount_usdt} USDT")
         return tx_hash.hex()
     except Exception as e:
