@@ -269,7 +269,7 @@ def process_code_submission(user_id: int, code: str):
         return "❌ Invalid code format! Use 5-15 letters/numbers"
     current_time = time.time()
     last_submit = user.get('last_submission', 0)
-    cooldown_remaining = 300 - (current_time - last_submit)
+    cooldown_remaining = 60 - (current_time - last_submit)
     if cooldown_remaining > 0:
         return f"⏳ Please wait {int(cooldown_remaining//60)}m {int(cooldown_remaining%60)}s before submitting another code"
     if user.get('submission_count', 0) >= 30:
